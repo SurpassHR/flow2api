@@ -38,21 +38,8 @@ class FlowClient:
             default=None
         )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
-
-        # Default "real browser" headers (Android Chrome style) to reduce upstream 4xx/5xx instability.
-        # These will be applied as defaults (won't override caller-provided headers).
-        self._default_client_headers = {
-            "sec-ch-ua-mobile": "?1",
-            "sec-ch-ua-platform": "\"Android\"",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "cross-site",
-            "x-browser-channel": "stable",
-            "x-browser-copyright": "Copyright 2026 Google LLC. All Rights reserved.",
-            "x-browser-validation": "UujAs0GAwdnCJ9nvrswZ+O+oco0=",
-            "x-browser-year": "2026",
-            "x-client-data": "CJS2yQEIpLbJAQipncoBCNj9ygEIlKHLAQiFoM0BGP6lzwE="
-        }
+        # 注意：不再注入硬编码的 Android/浏览器客户端头（sec-ch-ua-* / x-client-data / x-browser-validation）。
+        # 这些头若与真实 UA/浏览器指纹不一致，会触发上游风控校验失败。
         # 发车策略改为“请求到就发”：
         # 不在 flow2api 本地对提交做批次整形或排队，避免把同批请求打成阶梯。
 
@@ -229,10 +216,6 @@ class FlowClient:
                 headers["sec-ch-ua-mobile"] = fingerprint["sec_ch_ua_mobile"]
             if fingerprint.get("sec_ch_ua_platform"):
                 headers["sec-ch-ua-platform"] = fingerprint["sec_ch_ua_platform"]
-
-        # Add default Chromium/Android client headers (do not override explicitly provided values).
-        for key, value in self._default_client_headers.items():
-            headers.setdefault(key, value)
 
         # Log request
         if config.debug_enabled:
