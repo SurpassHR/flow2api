@@ -980,11 +980,26 @@ class Database:
             return None
 
     async def get_token_by_email(self, email: str) -> Optional[Token]:
-        """Get token by email"""
+        """Get token by email
+
+        邮箱按大小写不敏感匹配：Google 返回的邮箱大小写取决于用户在浏览器里的输入，
+        而 SQLite 的 `=` 是二进制比较。插件同步时若大小写或首尾空格不一致，就会查不到
+        已存在的账号，进而跑到“新增”分支，为同一账号插入第二行（email 上没有唯一约束，
+        只有 st 有）——会重复计入并发与余额配额。
+        """
+        normalized = (email or "").strip()
+        if not normalized:
+            return None
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM tokens WHERE email = ?", (email,))
+            cursor = await db.execute("SELECT * FROM tokens WHERE email = ?", (normalized,))
             row = await cursor.fetchone()
+            if row is None:
+                cursor = await db.execute(
+                    "SELECT * FROM tokens WHERE lower(trim(email)) = lower(?)",
+                    (normalized,),
+                )
+                row = await cursor.fetchone()
             if row:
                 return Token(**dict(row))
             return None

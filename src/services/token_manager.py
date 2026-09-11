@@ -399,6 +399,17 @@ class TokenManager:
         except Exception as e:
             raise ValueError(f"ST转AT失败: {str(e)}")
 
+        # email 上没有唯一约束（只有 st 有），同一账号可以被插入多行：多条 ST 指向同一账号
+        # 会重复占用并发与余额，插件同步碰到 ST 轮换时尤其容易踩到。这里不硬拦（同一账号
+        # 挂多个 ST 目前是允许的），但必须留痕，便于发现“本该更新却新增”的情况。
+        if email:
+            duplicate = await self.db.get_token_by_email(email)
+            if duplicate:
+                debug_logger.log_warning(
+                    f"[ADD_TOKEN] 账号已存在(token_id={duplicate.id}, email={email})，本次仍新增 token；"
+                    "插件同步遇到这种情况应走更新路径"
+                )
+
         try:
             credits_result = await self.flow_client.get_credits(at)
             credits = credits_result.get("credits", 0)
