@@ -266,6 +266,87 @@ class TokenManager:
         """Disable a token"""
         await self.db.update_token(token_id, is_active=False)
 
+    # ========== 会话自愈（ST/AT 刷新） ==========
+
+    async def _protocol_login_st(
+        self,
+        google_cookies: str,
+        proxy_url: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> str:
+        """用 Google 登录 cookie 走一遍协议登录，换回一份全新的 session token。"""
+        from .protocol_login import protocol_loginer
+
+        result = await protocol_loginer.login(
+            google_cookies,
+            proxy=(proxy_url or None),
+            email=(email or None),
+        )
+        if result.get("success") and result.get("session_token"):
+            return str(result["session_token"]).strip()
+        raise ValueError(str(result.get("error") or "协议登录未返回 session_token"))
+
+    async def resolve_session(
+        self,
+        st: str,
+        google_cookies: Optional[str] = None,
+        proxy_url: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """把一份可能已失效的 ST 换成可用的会话（必要时用 Google cookie 重新登录）。
+
+        背景：next-auth 在 access_token 过期且刷不出来时**仍然返回 200**，只在 body 里带
+        `error=ACCESS_TOKEN_REFRESH_NEEDED`。这种 ST 已经被解不开也刷不动了，唯一自愈方式是用
+        Google 登录 cookie（SID/HSID/SSID/APISID/SAPISID）重新走一遍 OAuth 换全新 ST，
+        也就是插件同步能“把 ST/AT 自己刷回来”的那条路。
+
+        返回 st_to_at 的 payload，另外带：
+            st            实际可用的 session token（可能已被换成新的）
+            st_refreshed  是否发生了重新登录换 ST
+            stale_reason  首次失败的原因（便于报错定位；仅在刷新后出现）
+        """
+        cookies = (google_cookies or "").strip()
+        stale_reason = ""
+
+        try:
+            payload = await self.flow_client.st_to_at(st)
+            if not payload.get("error") and payload.get("access_token"):
+                payload["st"] = st
+                payload["st_refreshed"] = False
+                return payload
+            stale_reason = str(payload.get("error") or "缺少 access_token")
+        except Exception as exc:
+            stale_reason = str(exc)
+
+        if not cookies:
+            raise ValueError(
+                f"会话不可用（{stale_reason}），且未提供可用于自助刷新的 Google Cookies；"
+                "请在已登录 labs.google 的浏览器里重新获取 session token，"
+                "或带上 Google 登录 cookie（SID/HSID/SSID/APISID/SAPISID）以启用协议刷新"
+            )
+
+        debug_logger.log_info(
+            f"[ST_REFRESH] ST 不可用（{stale_reason}），尝试用 Google Cookies 协议登录换新 ST..."
+        )
+        try:
+            new_st = await self._protocol_login_st(cookies, proxy_url=proxy_url, email=email)
+        except Exception as exc:
+            raise ValueError(f"协议登录刷新 ST 失败: {exc}（原始原因: {stale_reason}）")
+
+        payload = await self.flow_client.st_to_at(new_st)
+        if payload.get("error") or not payload.get("access_token"):
+            raise ValueError(
+                "协议登录已换到新 ST，但它仍不可用"
+                f"（{payload.get('error') or '缺少 access_token'}）；原始原因: {stale_reason}"
+            )
+
+        debug_logger.log_info("[ST_REFRESH] 协议登录换新 ST 成功")
+        record_token_refresh("st", "success")
+        payload["st"] = new_st
+        payload["st_refreshed"] = True
+        payload["stale_reason"] = stale_reason
+        return payload
+
     # ========== Token添加 (支持Project创建) ==========
 
     async def add_token(
@@ -291,11 +372,19 @@ class TokenManager:
         """Add a new token and prepare its pooled projects."""
         existing_token = await self.db.get_token_by_st(st)
         if existing_token:
-            raise ValueError(f"Token ??????: {existing_token.email}?")
+            raise ValueError(f"Token 已存在（邮箱: {existing_token.email}）")
 
         debug_logger.log_info(f"[ADD_TOKEN] Converting ST to AT...")
         try:
-            result = await self.flow_client.st_to_at(st)
+            # resolve_session 会在 ST 已失效（如 ACCESS_TOKEN_REFRESH_NEEDED）且带了
+            # Google cookie 时自动重新登录换新 ST，因此这里的 st 可能被换成新的。
+            result = await self.resolve_session(
+                st,
+                google_cookies=google_cookies,
+                proxy_url=proxy_url,
+                email=login_account,
+            )
+            st = result["st"]
             at = result["access_token"]
             expires = result.get("expires")
             user_info = result.get("user", {})
@@ -308,13 +397,15 @@ class TokenManager:
                 except Exception:
                     pass
         except Exception as e:
-            raise ValueError(f"ST?AT??: {str(e)}")
+            raise ValueError(f"ST转AT失败: {str(e)}")
 
         try:
             credits_result = await self.flow_client.get_credits(at)
             credits = credits_result.get("credits", 0)
             user_paygate_tier = credits_result.get("userPaygateTier")
-        except Exception:
+        except Exception as e:
+            # 余额获取失败不阻断添加，但必须留痕：这里的 401 往往就是 ST/AT 已失效的唯一信号
+            debug_logger.log_warning(f"[ADD_TOKEN] 获取余额失败（不影响添加）: {e}")
             credits = 0
             user_paygate_tier = None
 
@@ -343,7 +434,14 @@ class TokenManager:
                     tool_name="PINHOLE"
                 ))
             except Exception as e:
-                raise ValueError(f"??????: {str(e)}")
+                raise ValueError(f"创建项目失败: {str(e)}")
+
+        # 带了 Google cookie 却没显式指定协议时，默认启用协议刷新：
+        # 否则后台只会拿 ST 去刷 AT，ST 一旦失效就再也没机会自愈（插件同步尤其吃亏）。
+        effective_protocol_mode = self._normalize_protocol_mode(protocol_mode)
+        if (google_cookies or "").strip() and not (protocol_mode or "").strip():
+            effective_protocol_mode = "protocol"
+            debug_logger.log_info("[ADD_TOKEN] 已提供 Google Cookies，默认启用协议刷新(protocol)")
 
         token = Token(
             st=st,
@@ -363,7 +461,7 @@ class TokenManager:
             video_concurrency=video_concurrency,
             captcha_proxy_url=captcha_proxy_url,
             extension_route_key=extension_route_key,
-            protocol_mode=self._normalize_protocol_mode(protocol_mode),
+            protocol_mode=effective_protocol_mode,
             google_cookies=(google_cookies or "").strip(),
             login_account=(login_account or "").strip(),
             login_password=login_password or "",
@@ -440,8 +538,12 @@ class TokenManager:
             update_fields["captcha_proxy_url"] = captcha_proxy_url
         if extension_route_key is not None:
             update_fields["extension_route_key"] = extension_route_key
-        if protocol_mode is not None:
+        if protocol_mode is not None or (google_cookies or "").strip():
+            # 与 add_token 一致：带了 Google cookie 而未显式指定协议时默认启用协议刷新，
+            # 否则这类 token 永远只能拿 ST 去刷 AT，ST 一失效就失去自愈能力。
             update_fields["protocol_mode"] = self._normalize_protocol_mode(protocol_mode)
+            if (google_cookies or "").strip() and not (protocol_mode or "").strip():
+                update_fields["protocol_mode"] = "protocol"
         if google_cookies is not None:
             update_fields["google_cookies"] = google_cookies.strip()
         if login_account is not None:
@@ -692,35 +794,21 @@ class TokenManager:
             return None
 
         try:
-            from .protocol_login import protocol_loginer
-
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试协议刷新 ST...")
-            login_result = await protocol_loginer.login(
+            new_st = await self._protocol_login_st(
                 token.google_cookies,
-                proxy=(getattr(token, "proxy_url", "") or None),
+                proxy_url=(getattr(token, "proxy_url", "") or None),
                 email=(getattr(token, "login_account", "") or token.email or None),
             )
-            if login_result.get("success") and login_result.get("session_token"):
-                new_st = str(login_result["session_token"]).strip()
-                await self.db.update_token(
-                    token_id,
-                    st=new_st,
-                    last_st_refresh_at=datetime.now(timezone.utc),
-                    last_st_refresh_result="success",
-                )
-                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 协议刷新 ST 成功")
-                record_token_refresh("st", "success")
-                return new_st
-
-            error = str(login_result.get("error") or "协议刷新失败")
             await self.db.update_token(
                 token_id,
+                st=new_st,
                 last_st_refresh_at=datetime.now(timezone.utc),
-                last_st_refresh_result=error,
+                last_st_refresh_result="success",
             )
-            debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: 协议刷新 ST 失败 - {error}")
-            record_token_refresh("st", "failure")
-            return None
+            debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 协议刷新 ST 成功")
+            record_token_refresh("st", "success")
+            return new_st
         except Exception as e:
             await self.db.update_token(
                 token_id,

@@ -1200,7 +1200,7 @@ class FlowClient:
         """
         url = f"{self.labs_base_url}/auth/session"
         try:
-            return await self._make_request(
+            payload = await self._make_request(
                 method="GET",
                 url=url,
                 use_st=True,
@@ -1214,7 +1214,7 @@ class FlowClient:
             debug_logger.log_warning(
                 f"[AUTH] ST->AT failed via configured proxy, retrying direct connection: {e}"
             )
-            return await self._make_request(
+            payload = await self._make_request(
                 method="GET",
                 url=url,
                 use_st=True,
@@ -1222,6 +1222,18 @@ class FlowClient:
                 timeout=self._get_control_plane_timeout(),
                 force_no_proxy=True,
             )
+
+        # next-auth 在 access_token 已过期且无法自刷新时仍返回 200，只在 body 里带
+        # error=ACCESS_TOKEN_REFRESH_NEEDED（同时对每次响应轮换 session-token cookie）。
+        # 这种会话能读出邮箱，但拿它去调 Flow/PA 接口必然 401 UNAUTHENTICATED，必须留痕，
+        # 否则现场只能看到后面“创建项目失败/HTTP Error 401”的二手报错。
+        if isinstance(payload, dict) and payload.get("error"):
+            debug_logger.log_warning(
+                f"[AUTH] ST->AT 返回会话异常标记 error={payload['error']}"
+                "（session token 仍能识别账号，但其 access_token 无法刷新，后续接口大概率 401；"
+                "需在已登录 labs.google 的浏览器中重新获取 cookie）"
+            )
+        return payload
 
     # ========== 项目管理 (使用ST) ==========
 

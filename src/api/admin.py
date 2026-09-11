@@ -2352,16 +2352,21 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     if not session_token:
         raise HTTPException(status_code=400, detail="Missing session_token")
 
-    # Step 1: Convert ST to AT to get user info (including email)
+    # Step 1: 用统一的自愈入口换取可用会话
+    # ST 本身失效（ACCESS_TOKEN_REFRESH_NEEDED / 401）但插件带了 Google cookie 时，
+    # resolve_session 会直接重新登录换一份新 ST，插件同步因此不再必须手工重登浏览器。
     try:
-        result = await token_manager.flow_client.st_to_at(session_token)
+        result = await token_manager.resolve_session(
+            session_token,
+            google_cookies=request.get("google_cookies"),
+            proxy_url=request.get("proxy_url"),
+            email=request.get("login_account"),
+        )
+        session_token = result["st"]          # 可能已被协议登录换成新的
         at = result["access_token"]
         expires = result.get("expires")
         user_info = result.get("user", {})
         email = user_info.get("email", "")
-
-        if not email:
-            raise HTTPException(status_code=400, detail="Failed to get email from session token")
 
         # Parse expiration time
         from datetime import datetime
@@ -2374,6 +2379,9 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid session token: {str(e)}")
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Failed to get email from session token")
 
     # Step 2: Check if token with this email exists
     existing_token = await db.get_token_by_email(email)
@@ -2419,7 +2427,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
             new_token = await token_manager.add_token(
                 st=session_token,
                 remark="Added by Chrome Extension",
-                protocol_mode=request.get("protocol_mode", "session"),
+                # 不强行给 "session" 默认值：带 Google cookie 时由 add_token 自动启用协议刷新
+                protocol_mode=request.get("protocol_mode"),
                 google_cookies=request.get("google_cookies"),
                 login_account=request.get("login_account"),
                 login_password=request.get("login_password"),
