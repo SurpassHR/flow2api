@@ -1,0 +1,16 @@
+# 本地部署定制:
+# - 端口仅绑定 127.0.0.1(与 grok2api 同样的安全惯例),对外由 nginx 反代
+# - 内存限制 256MB(服务器仅 891MB 内存,防止 OOM 影响其他服务)
+services:
+  flow2api:
+    ports: !override
+      - "127.0.0.1:38000:8000"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

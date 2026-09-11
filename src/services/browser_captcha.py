@@ -427,6 +427,7 @@ class TokenBrowser:
         self._shared_reuse_count = 0
         self._consecutive_browser_failures = 0
         self._solve_inflight = 0
+        self._busy_since: Optional[float] = None
         self._last_idle_since = time.monotonic()
         self._refresh_browser_profile()
 
@@ -1079,6 +1080,14 @@ class TokenBrowser:
         return token_key, session_token, cookie_signature
 
     async def _ensure_shared_token_binding(self, context, token_id: Optional[int]) -> bool:
+        # 本地补丁:跳过登录态绑定。带登录 cookie 打开 labs.google/fx/tools/flow 会被
+        # 间歇性重定向到 flow.google.com/about(该页无 grecaptcha),导致打码必败;
+        # reCAPTCHA Enterprise 打码为匿名执行,不依赖账号登录态。
+        # 注意:仍需记录绑定标记,否则 token_changed 检查会误判为绑定变化,
+        # 导致每次打码/重试都重建浏览器(launches 累加、打码变慢、更容易触发上游限流)。
+        self._shared_bound_token_id = self._normalize_token_key(token_id)
+        self._shared_bound_cookie_signature = None
+        return True
         token_key, session_token, cookie_signature = await self._load_token_session_binding(token_id)
 
         if token_key is None:
@@ -1134,8 +1143,30 @@ class TokenBrowser:
         """打开真实 Flow 页面并完成页面预热。"""
         primary_host = "https://www.recaptcha.net" if self._browser_proxy_active else "https://www.google.com"
         secondary_host = "https://www.google.com" if primary_host == "https://www.recaptcha.net" else "https://www.recaptcha.net"
-        page_urls = [self._build_flow_project_url(project_id), LABS_URL]
+        page_urls = [LABS_URL, self._build_flow_project_url(project_id)]
         label = f"{context_label} " if context_label else ""
+
+        # 防跳转:Google 会间歇性把登录用户重定向到 flow.google.com/about(该页无 grecaptcha),
+        # 拦截打码页面的顶层导航,强制留在 labs.google 域
+        try:
+            async def _block_flow_redirect(route):
+                try:
+                    req = route.request
+                    if req.is_navigation_request() and req.frame.parent_frame is None:
+                        debug_logger.log_warning(
+                            f"[BrowserCaptcha] Token-{self.token_id} {label}已拦截跳转: {req.url[:120]}"
+                        )
+                        await route.abort()
+                    else:
+                        await route.continue_()
+                except Exception:
+                    try:
+                        await route.continue_()
+                    except Exception:
+                        pass
+            await page.route("https://flow.google.com/**", _block_flow_redirect)
+        except Exception:
+            pass
 
         loaded = False
         last_error: Optional[str] = None
@@ -1272,6 +1303,7 @@ class TokenBrowser:
         height = self._profile_viewport["height"]
         viewport = {"width": width, "height": height}
         launch_in_background = bool(getattr(config, "browser_launch_background", True))
+        headless = config.browser_headless
 
         if manage_slot_pid:
             await self._cleanup_stale_slot_process()
@@ -1319,6 +1351,8 @@ class TokenBrowser:
                     browser_args.append('--window-position=-32000,-32000')
                 debug_logger.log_info(
                     f"[BrowserCaptcha] Token-{self.token_id} headed browser will launch in background mode"
+                    if not headless
+                    else f"[BrowserCaptcha] Token-{self.token_id} headless browser will launch"
                 )
 
             if browser_executable_path:
@@ -1327,7 +1361,7 @@ class TokenBrowser:
                 )
 
             browser = await playwright.chromium.launch(
-                headless=False,
+                headless=headless,
                 executable_path=browser_executable_path,
                 proxy=proxy_option,
                 args=browser_args,
@@ -1891,12 +1925,7 @@ class TokenBrowser:
             script_path = "recaptcha/enterprise.js" if enterprise else "recaptcha/api.js"
             execute_target = "grecaptcha.enterprise.execute" if enterprise else "grecaptcha.execute"
             ready_target = "grecaptcha.enterprise.ready" if enterprise else "grecaptcha.ready"
-            wait_expression = (
-                "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && "
-                "typeof grecaptcha.enterprise.execute === 'function'"
-            ) if enterprise else (
-                "typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function'"
-            )
+            wait_expression = "() => (typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function')" if enterprise else "() => (typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function')"
             api_label = "enterprise.js" if enterprise else "api.js"
 
             debug_logger.log_info(
@@ -1976,7 +2005,7 @@ class TokenBrowser:
                 )
                 try:
                     await page.evaluate(f"""
-                        (primaryUrl, secondaryUrl) => {{
+                        ([primaryUrl, secondaryUrl]) => {{
                             const existing = Array.from(document.scripts || []).some((script) => {{
                                 const src = script?.src || "";
                                 return src.includes('/recaptcha/');
@@ -1986,14 +2015,15 @@ class TokenBrowser:
                             const loadScript = (index) => {{
                                 if (index >= urls.length) return;
                                 const script = document.createElement('script');
-                                script.src = urls[index];
+                                try {{ if (!window.__f2aPolicy && window.trustedTypes && window.trustedTypes.createPolicy) {{ window.__f2aPolicy = window.trustedTypes.createPolicy('f2a-captcha', {{ createScriptURL: (s) => s }}); }} }} catch (e) {{}}
+                                script.src = (window.__f2aPolicy ? window.__f2aPolicy.createScriptURL(urls[index]) : urls[index]);
                                 script.async = true;
                                 script.onerror = () => loadScript(index + 1);
                                 document.head.appendChild(script);
                             }};
                             loadScript(0);
                         }}
-                    """, f"{primary_host}/{script_path}?render={website_key}", f"{secondary_host}/{script_path}?render={website_key}")
+                    """, [f"{primary_host}/{script_path}?render={website_key}", f"{secondary_host}/{script_path}?render={website_key}"])
                     await page.wait_for_function(wait_expression, timeout=15000)
                 except Exception as inject_error:
                     debug_logger.log_warning(
@@ -2062,6 +2092,22 @@ class TokenBrowser:
     def is_busy(self) -> bool:
         return self._solve_inflight > 0
 
+    def busy_seconds(self) -> Optional[float]:
+        """返回当前打码任务已持续的秒数;无任务或未记录起始时间时返回 None。"""
+        if self._solve_inflight <= 0 or self._busy_since is None:
+            return None
+        return time.monotonic() - self._busy_since
+
+    def reset_stuck_solve(self):
+        """悬挂兜底:强制复位 in-flight 计数并重建信号量。
+
+        由 idle reaper 在打码任务超长(疑似悬挂)时调用,确保槽位可被后续请求复用。
+        """
+        self._solve_inflight = 0
+        self._busy_since = None
+        self._semaphore = asyncio.Semaphore(1)
+        self.note_idle()
+
     def note_idle(self):
         if self._solve_inflight <= 0:
             self._last_idle_since = time.monotonic()
@@ -2091,11 +2137,7 @@ class TokenBrowser:
         context_label: str = "",
     ) -> bool:
         """等待 grecaptcha.enterprise 就绪，必要时补注入 enterprise.js。"""
-        wait_expression = (
-            "typeof grecaptcha !== 'undefined' && "
-            "typeof grecaptcha.enterprise !== 'undefined' && "
-            "typeof grecaptcha.enterprise.execute === 'function'"
-        )
+        wait_expression = "() => (typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function')"
         label = f"{context_label} " if context_label else ""
         try:
             await page.wait_for_function(wait_expression, timeout=timeout_ms)
@@ -2105,11 +2147,16 @@ class TokenBrowser:
                 f"[BrowserCaptcha] Token-{self.token_id} {label}grecaptcha 未就绪，尝试补注入脚本: "
                 f"{type(e).__name__}: {str(e)[:200]}"
             )
+            try:
+                _diag = await page.evaluate("() => ({url: location.href.slice(0,140), title: document.title.slice(0,60), grec: typeof grecaptcha, ent: (typeof grecaptcha !== 'undefined' ? typeof grecaptcha.enterprise : 'n/a'), rs: document.readyState, tt: (typeof trustedTypes !== 'undefined'), recScripts: Array.from(document.scripts).map(x => x.src || '').filter(x => x.includes('recaptcha')).slice(0,3), bodyHead: (document.body ? document.body.innerText.slice(0, 150) : '')})")
+                debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} {label}页面诊断: {_diag}")
+            except Exception as _de:
+                debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} {label}诊断失败: {type(_de).__name__}: {str(_de)[:150]}")
 
         try:
             await page.evaluate(
                 """
-                (primaryUrl, secondaryUrl) => {
+                ([primaryUrl, secondaryUrl]) => {
                     const existing = Array.from(document.scripts || []).some((script) => {
                         const src = script?.src || "";
                         return src.includes('/recaptcha/enterprise.js');
@@ -2119,7 +2166,8 @@ class TokenBrowser:
                     const loadScript = (index) => {
                         if (index >= urls.length) return;
                         const script = document.createElement('script');
-                        script.src = urls[index];
+                        try { if (!window.__f2aPolicy && window.trustedTypes && window.trustedTypes.createPolicy) { window.__f2aPolicy = window.trustedTypes.createPolicy('f2a-captcha', { createScriptURL: (s) => s }); } } catch (e) {}
+                        script.src = (window.__f2aPolicy ? window.__f2aPolicy.createScriptURL(urls[index]) : urls[index]);
                         script.async = true;
                         script.onerror = () => loadScript(index + 1);
                         document.head.appendChild(script);
@@ -2127,8 +2175,10 @@ class TokenBrowser:
                     loadScript(0);
                 }
                 """,
-                f"{primary_host}/recaptcha/enterprise.js?render={website_key}",
-                f"{secondary_host}/recaptcha/enterprise.js?render={website_key}",
+                [
+                    f"{primary_host}/recaptcha/enterprise.js?render={website_key}",
+                    f"{secondary_host}/recaptcha/enterprise.js?render={website_key}",
+                ],
             )
             await page.wait_for_function(wait_expression, timeout=timeout_ms)
             return True
@@ -2171,16 +2221,22 @@ class TokenBrowser:
         """在同一浏览器上下文中完成打码并直接提交 Flow 请求。"""
         async with self._semaphore:
             self._solve_inflight += 1
+            self._busy_since = time.monotonic()
             max_retries = max(3, int(getattr(config, "browser_captcha_max_retries", 5) or 5))
+            # 本地补丁:单次浏览器内提交硬超时,防止打码悬挂永久占住槽位导致浏览器“关不上”
+            solve_timeout = config.browser_captcha_solve_timeout
 
             try:
                 for attempt in range(max_retries):
                     page = None
                     try:
                         start_ts = time.time()
-                        _, _, context = await self._get_or_create_shared_browser(
-                            token_proxy_url=token_proxy_url,
-                            token_id=token_id,
+                        _, _, context = await asyncio.wait_for(
+                            self._get_or_create_shared_browser(
+                                token_proxy_url=token_proxy_url,
+                                token_id=token_id,
+                            ),
+                            timeout=solve_timeout,
                         )
 
                         page = await context.new_page()
@@ -2193,12 +2249,15 @@ class TokenBrowser:
                             f"[BrowserCaptcha] Token-{self.token_id} 浏览器内提交 Flow 请求: "
                             f"action={action}, project_id={project_id}"
                         )
-                        ready = await self._prepare_flow_runtime_page(
-                            page,
-                            project_id,
-                            website_key,
-                            action,
-                            context_label="浏览器内提交",
+                        ready = await asyncio.wait_for(
+                            self._prepare_flow_runtime_page(
+                                page,
+                                project_id,
+                                website_key,
+                                action,
+                                context_label="浏览器内提交",
+                            ),
+                            timeout=solve_timeout,
                         )
                         if not ready:
                             raise RuntimeError("grecaptcha.enterprise 未就绪")
@@ -2311,7 +2370,21 @@ class TokenBrowser:
                             f"{error_message[:240]}"
                         )
                         error_lower = error_message.lower()
-                        if any(
+                        # 本地补丁:硬超时(打码悬挂)必须强制回收浏览器,否则槽位被永久占住
+                        if isinstance(e, asyncio.TimeoutError) or "timeouterror" in error_lower:
+                            debug_logger.log_error(
+                                f"[BrowserCaptcha] Token-{self.token_id} 浏览器内提交硬超时(>{solve_timeout}s)，强制回收浏览器"
+                            )
+                            try:
+                                await self.recycle_browser(
+                                    reason="submit_hard_timeout",
+                                    rotate_profile=False,
+                                )
+                            except Exception as recycle_error:
+                                debug_logger.log_warning(
+                                    f"[BrowserCaptcha] Token-{self.token_id} 超时回收浏览器失败: {recycle_error}"
+                                )
+                        elif any(
                             keyword in error_lower
                             for keyword in [
                                 "context or browser has been closed",
@@ -2339,6 +2412,7 @@ class TokenBrowser:
                 raise RuntimeError("浏览器内提交 Flow 请求失败")
             finally:
                 self._solve_inflight = max(0, self._solve_inflight - 1)
+                self._busy_since = None
                 self.note_idle()
     
     async def get_token(
@@ -2352,18 +2426,29 @@ class TokenBrowser:
         """Get a token from the shared browser unless a fatal browser error occurs."""
         async with self._semaphore:
             self._solve_inflight += 1
+            self._busy_since = time.monotonic()
             max_retries = 3
+            # 本地补丁:单次打码硬超时,防止打码悬挂永久占住槽位导致浏览器“关不上”
+            solve_timeout = config.browser_captcha_solve_timeout
+
+            async def _solve_once() -> Optional[str]:
+                _, _, context = await asyncio.wait_for(
+                    self._get_or_create_shared_browser(
+                        token_proxy_url=token_proxy_url,
+                        token_id=token_id,
+                    ),
+                    timeout=solve_timeout,
+                )
+                return await asyncio.wait_for(
+                    self._execute_captcha(context, project_id, website_key, action),
+                    timeout=solve_timeout,
+                )
 
             try:
                 for attempt in range(max_retries):
                     try:
                         start_ts = time.time()
-                        _, _, context = await self._get_or_create_shared_browser(
-                            token_proxy_url=token_proxy_url,
-                            token_id=token_id,
-                        )
-
-                        token = await self._execute_captcha(context, project_id, website_key, action)
+                        token = await asyncio.wait_for(_solve_once(), timeout=solve_timeout * 2)
                         if token:
                             self._solve_count += 1
                             self._consecutive_browser_failures = 0
@@ -2387,7 +2472,18 @@ class TokenBrowser:
                             f"[BrowserCaptcha] Token-{self.token_id} browser error: {error_message[:200]}"
                         )
                         error_lower = error_message.lower()
-                        if any(keyword in error_lower for keyword in [
+                        # 本地补丁:硬超时(打码悬挂)必须强制回收浏览器,否则槽位被永久占住
+                        if isinstance(e, asyncio.TimeoutError) or "timeouterror" in error_lower:
+                            debug_logger.log_error(
+                                f"[BrowserCaptcha] Token-{self.token_id} 打码硬超时(>{solve_timeout}s)，强制回收浏览器"
+                            )
+                            try:
+                                await self.recycle_browser(reason="solve_hard_timeout", rotate_profile=False)
+                            except Exception as recycle_error:
+                                debug_logger.log_warning(
+                                    f"[BrowserCaptcha] Token-{self.token_id} 超时回收浏览器失败: {recycle_error}"
+                                )
+                        elif any(keyword in error_lower for keyword in [
                             "context or browser has been closed",
                             "target closed",
                             "browser has been closed",
@@ -2403,6 +2499,7 @@ class TokenBrowser:
                 return None, None
             finally:
                 self._solve_inflight = max(0, self._solve_inflight - 1)
+                self._busy_since = None
                 self.note_idle()
 
     async def get_custom_token(
@@ -2415,6 +2512,7 @@ class TokenBrowser:
         """Get a custom reCAPTCHA token using a temporary browser."""
         async with self._semaphore:
             self._solve_inflight += 1
+            self._busy_since = time.monotonic()
             max_retries = 3
 
             try:
@@ -2464,6 +2562,7 @@ class TokenBrowser:
                 return None
             finally:
                 self._solve_inflight = max(0, self._solve_inflight - 1)
+                self._busy_since = None
                 self.note_idle()
 
     async def get_custom_score(
@@ -2477,6 +2576,7 @@ class TokenBrowser:
         """Get a custom token and verify its score using a temporary browser."""
         async with self._semaphore:
             self._solve_inflight += 1
+            self._busy_since = time.monotonic()
             max_retries = 3
 
             try:
@@ -2534,6 +2634,7 @@ class TokenBrowser:
                 }
             finally:
                 self._solve_inflight = max(0, self._solve_inflight - 1)
+                self._busy_since = None
                 self.note_idle()
 
 
@@ -2579,12 +2680,25 @@ class BrowserCaptchaService:
             try:
                 await asyncio.sleep(15)
                 idle_ttl = int(getattr(config, "browser_idle_ttl_seconds", 600) or 600)
+                # 本地补丁:打码持续超长视为悬挂,强制回收浏览器并复位槽位,
+                # 避免浏览器进程永久存活(“关不上”)且后续请求永久阻塞在槽位信号量上
+                max_busy = config.browser_captcha_max_busy_seconds
                 browsers = []
                 async with self._browsers_lock:
                     browsers = list(self._browsers.values())
                 for browser in browsers:
                     try:
                         if browser.is_busy():
+                            busy_seconds = browser.busy_seconds()
+                            if busy_seconds is not None and busy_seconds >= max_busy:
+                                debug_logger.log_warning(
+                                    f"[BrowserCaptcha] 打码悬挂兜底: slot busy {busy_seconds:.0f}s>={max_busy}s, 强制回收"
+                                )
+                                try:
+                                    await browser.recycle_browser(reason="stuck_busy_backstop", rotate_profile=False)
+                                except Exception as recycle_error:
+                                    debug_logger.log_warning(f"[BrowserCaptcha] 悬挂回收失败: {recycle_error}")
+                                browser.reset_stuck_solve()
                             continue
                         if not browser.has_shared_browser():
                             continue

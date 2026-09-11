@@ -1,0 +1,84 @@
+diff --git a/src/api/routes.py b/src/api/routes.py
+index 61a4f28..30cc4d5 100644
+--- a/src/api/routes.py
++++ b/src/api/routes.py
+@@ -2,6 +2,7 @@
+ 
+ from dataclasses import dataclass
+ from typing import Any, Dict, List, Optional
++import asyncio
+ import base64
+ import json
+ import mimetypes
+@@ -717,6 +718,51 @@ async def _convert_openai_stream_chunk_to_gemini_event(
+     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+ 
+ 
++async def _stream_with_sse_heartbeat(agen, interval: float = 15.0):
++    """SSE 心跳包装器:内层生成器长时间无数据时,定期发送一行 SSE 注释。
++
++    Cloudflare 免费版对空闲响应约 100 秒切断,而图片生成在"打码+提交"阶段
++    可能 60~120 秒不产生任何流事件。SSE 注释行(": keepalive")会被标准客户端
++    忽略,但能让 Cloudflare/nginx 的空闲计时器复位,避免流被中途掐断。
++
++    客户端断开时,外层生成器被取消 → pump 任务随之取消 → CancelledError
++    传入内层 handle_generation,其"生成已取消"逻辑保持不变。
++    """
++    queue: asyncio.Queue = asyncio.Queue()
++    _SENTINEL = object()
++
++    async def _pump():
++        try:
++            async for chunk in agen:
++                queue.put_nowait(chunk)
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:  # noqa: BLE001
++            queue.put_nowait(exc)
++        finally:
++            queue.put_nowait(_SENTINEL)
++
++    task = asyncio.create_task(_pump())
++    try:
++        while True:
++            try:
++                item = await asyncio.wait_for(queue.get(), timeout=interval)
++            except asyncio.TimeoutError:
++                yield ": keepalive\n\n"
++                continue
++            if item is _SENTINEL:
++                break
++            if isinstance(item, Exception):
++                raise item
++            yield item
++    finally:
++        task.cancel()
++        try:
++            await task
++        except asyncio.CancelledError:
++            pass
++
++
+ async def _iterate_openai_stream(
+     normalized: NormalizedGenerationRequest,
+     base_url_override: Optional[str] = None,
+@@ -866,7 +912,7 @@ async def create_chat_completion(
+ 
+         if request.stream:
+             return StreamingResponse(
+-                _iterate_openai_stream(normalized, request_base_url),
++                _stream_with_sse_heartbeat(_iterate_openai_stream(normalized, request_base_url)),
+                 media_type="text/event-stream",
+                 headers={
+                     "Cache-Control": "no-cache",
+@@ -956,7 +1002,9 @@ async def stream_generate_content(
+         request_base_url = _get_request_base_url(raw_request)
+ 
+         return StreamingResponse(
+-            _iterate_gemini_stream(normalized, normalized.model, request_base_url),
++            _stream_with_sse_heartbeat(
++                _iterate_gemini_stream(normalized, normalized.model, request_base_url)
++            ),
+             media_type="text/event-stream",
+             headers={
+                 "Cache-Control": "no-cache",

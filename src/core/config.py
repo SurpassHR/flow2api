@@ -422,6 +422,17 @@ class Config:
         self._config["captcha"]["browser_launch_background"] = bool(enabled)
 
     @property
+    def browser_headless(self) -> bool:
+        """browser 模式是否使用无头浏览器，内存紧张时开启可省 100-150MB。"""
+        return bool(self._config.get("captcha", {}).get("browser_headless", False))
+
+    def set_browser_headless(self, enabled: bool):
+        """设置 browser 模式是否使用无头浏览器。"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["browser_headless"] = bool(enabled)
+
+    @property
     def browser_count(self) -> int:
         """浏览器打码实例数量，browser/personal 模式共用。"""
         value = self._config.get("captcha", {}).get("browser_count", 1)
@@ -470,6 +481,24 @@ class Config:
             return max(1, min(20, int(value)))
         except Exception:
             return 6
+
+    @property
+    def browser_captcha_solve_timeout(self) -> int:
+        """单次打码硬超时(秒)，超时强制回收浏览器防止悬挂。"""
+        value = self._config.get("captcha", {}).get("browser_captcha_solve_timeout", 150)
+        try:
+            return max(30, int(value))
+        except Exception:
+            return 150
+
+    @property
+    def browser_captcha_max_busy_seconds(self) -> int:
+        """打码 busy 超过该秒数时，idle reaper 强制回收浏览器兜底。"""
+        value = self._config.get("captcha", {}).get("browser_captcha_max_busy_seconds", 900)
+        try:
+            return max(300, int(value))
+        except Exception:
+            return 900
 
     @property
     def personal_max_resident_tabs(self) -> int:

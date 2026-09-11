@@ -1,0 +1,20 @@
+# headed 打码模式定制(叠加在 docker-compose.headed.yml 之上):
+# - 端口绑定 127.0.0.1:38000,对外仍由 nginx 反代(与标准模式一致的入口)
+# - shm 降为 256m(891MB 小内存服务器,2gb 的默认值会占满 tmpfs)
+# - 不设 mem limit:Xvfb+Chromium 需要弹性内存,由 swap 兜底
+services:
+  flow2api-headed:
+    ports: !override
+      - "127.0.0.1:38000:8000"
+    shm_size: "512m"
+    volumes:
+      - ./data:/app/data
+      - ./tmp:/app/tmp
+      - ./config/setting.toml:/app/config/setting.toml
+      # 本地补丁:browser_captcha.py 兼容 Trusted Types 与 Playwright 参数签名
+      - ./src:/app/src
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

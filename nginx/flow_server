@@ -1,0 +1,36 @@
+# ============================================================
+# flow2api 反向代理（flow.hrfuqiang.top，Cloudflare 橙色云代理）
+# 2026-09-07 变更（首次创建）：
+#   - 反代 127.0.0.1:38000（flow2api 容器，仅本地监听）
+#   - 复用 Cloudflare Origin CA 泛域名证书（*.hrfuqiang.top，2041 年到期）
+#   - SSE 流式响应关闭代理缓冲；视频生成耗时长，放宽读超时
+#   - 真实 IP 还原复用公共 snippet（与 grok/cpa 共用），由 flow2api-proxy.conf
+#     在 server 作用域 include——本文件不放 http 作用域，
+#     因为 grok2api_server 已占用 http 作用域的 real_ip_header（每个上下文仅能声明一次）
+#   - /metrics 仅限本机访问（含内部指标），/health 保持公开（设计为健康检查）
+# ============================================================
+
+# ---------- HTTP ----------
+# 不做协议判断跳转：CF Flexible 模式回源走 80 端口，$http_x_forwarded_proto 恒为
+# http，任何基于它的 301 都会把 https 用户请求也重定向到自身 → CF 缓存坏 301 →
+# 死循环。用户侧 http→https 跳转由 Cloudflare 的 Always Use HTTPS 完成（CF 层
+# 301，不缓存、不循环）。
+server {
+    listen 80;
+    server_name flow.hrfuqiang.top;
+
+    include snippets/flow2api-proxy.conf;
+}
+
+# ---------- HTTPS ----------
+server {
+    listen 443 ssl http2;
+    server_name flow.hrfuqiang.top;
+
+    ssl_certificate     /etc/nginx/ssl/grok2api.crt;
+    ssl_certificate_key /etc/nginx/ssl/grok2api.key;
+
+    client_max_body_size 50M;
+
+    include snippets/flow2api-proxy.conf;
+}
