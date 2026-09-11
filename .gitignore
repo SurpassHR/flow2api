@@ -52,7 +52,12 @@ logs.txt
 # Temporary files
 *.tmp
 *.bak
+# 带日期后缀的备份（*.bak 覆盖不到）
+*.bak-*
 *.cache
+
+# 本地工具目录
+.freebuff/
 
 browser_data
 browser_data_rt
