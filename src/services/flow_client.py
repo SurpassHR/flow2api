@@ -1039,6 +1039,23 @@ class FlowClient:
         """保留接口形状，当前无需释放任何本地发车状态。"""
         return
 
+    def _should_submit_in_browser(self, project_id: Optional[str]) -> bool:
+        """browser 模式下是否在打码浏览器里提交生成请求。
+
+        应用页拿不到 grecaptcha 时(flow.google.com 迁移后匿名访问被路由到 /about),
+        browser_captcha 会标记不可用一段时间,期间改走服务端 HTTP 提交,
+        避免每个请求都白等几轮页面预热;冷却结束后会自动重试浏览器内提交。
+        """
+        if config.captcha_method != "browser" or not project_id:
+            return False
+        if not config.browser_captcha_submit_in_browser:
+            return False
+        try:
+            from .browser_captcha import is_in_browser_submit_available
+        except Exception:
+            return True
+        return is_in_browser_submit_available()
+
     async def _make_image_generation_request(
         self,
         url: str,
@@ -1096,58 +1113,74 @@ class FlowClient:
                     "timeout_seconds": request_timeout,
                     "used_media_proxy": bool(prefer_media_proxy),
                 }
+
+            async def _submit_image_via_http() -> Dict[str, Any]:
+                return await self._make_request(
+                    method="POST",
+                    url=url,
+                    headers=self._build_labs_request_context_headers(project_id),
+                    json_data=json_data,
+                    use_at=True,
+                    at_token=at,
+                    timeout=request_timeout,
+                    use_media_proxy=prefer_media_proxy,
+                    respect_fingerprint_proxy=not prefer_media_proxy,
+                )
+
             try:
-                if config.captcha_method == "browser" and project_id:
-                    from .browser_captcha import BrowserCaptchaService
+                if self._should_submit_in_browser(project_id):
+                    from .browser_captcha import BrowserCaptchaService, BrowserSubmitUnavailable
 
                     service = await BrowserCaptchaService.get_instance(self.db)
-                    response_payload, _browser_ref, fingerprint = await service.submit_flow_request(
-                        project_id=project_id,
-                        action="IMAGE_GENERATION",
-                        token_id=token_id,
-                        url=url,
-                        at_token=at,
-                        json_data=json_data,
-                        timeout=request_timeout,
-                    )
-                    self._set_request_fingerprint(fingerprint if fingerprint else None)
+                    response_payload = None
+                    try:
+                        response_payload, _browser_ref, fingerprint = await service.submit_flow_request(
+                            project_id=project_id,
+                            action="IMAGE_GENERATION",
+                            token_id=token_id,
+                            url=url,
+                            at_token=at,
+                            json_data=json_data,
+                            timeout=request_timeout,
+                        )
+                    except BrowserSubmitUnavailable as submit_unavailable:
+                        # 应用页拿不到 grecaptcha(如 flow.google.com 迁移后匿名被路由到 /about),
+                        # 改用服务端 HTTP 提交,不再重复等待页面预热。
+                        debug_logger.log_warning(
+                            f"[IMAGE] 浏览器内提交不可用,本次改用 HTTP 提交: {str(submit_unavailable)[:200]}"
+                        )
 
-                    status_code = int(response_payload.get("status") or 0)
-                    response_text = response_payload.get("text") or ""
-                    if status_code >= 400:
-                        error_reason = f"HTTP Error {status_code}"
-                        parsed_body = None
-                        try:
-                            parsed_body = json.loads(response_text) if response_text else None
-                        except Exception:
+                    if response_payload is None:
+                        result = await _submit_image_via_http()
+                    else:
+                        self._set_request_fingerprint(fingerprint if fingerprint else None)
+
+                        status_code = int(response_payload.get("status") or 0)
+                        response_text = response_payload.get("text") or ""
+                        if status_code >= 400:
+                            error_reason = f"HTTP Error {status_code}"
                             parsed_body = None
-                        if isinstance(parsed_body, dict) and "error" in parsed_body:
-                            error_info = parsed_body["error"] or {}
-                            error_message = error_info.get("message", "")
-                            details = error_info.get("details", [])
-                            for detail in details or []:
-                                if isinstance(detail, dict) and detail.get("reason"):
-                                    error_reason = detail.get("reason")
-                                    break
-                            if error_message:
-                                error_reason = f"{error_reason}: {error_message}"
-                        elif response_text:
-                            error_reason = f"HTTP Error {status_code}: {response_text[:200]}"
-                        raise Exception(error_reason)
+                            try:
+                                parsed_body = json.loads(response_text) if response_text else None
+                            except Exception:
+                                parsed_body = None
+                            if isinstance(parsed_body, dict) and "error" in parsed_body:
+                                error_info = parsed_body["error"] or {}
+                                error_message = error_info.get("message", "")
+                                details = error_info.get("details", [])
+                                for detail in details or []:
+                                    if isinstance(detail, dict) and detail.get("reason"):
+                                        error_reason = detail.get("reason")
+                                        break
+                                if error_message:
+                                    error_reason = f"{error_reason}: {error_message}"
+                            elif response_text:
+                                error_reason = f"HTTP Error {status_code}: {response_text[:200]}"
+                            raise Exception(error_reason)
 
-                    result = json.loads(response_text) if response_text else {}
+                        result = json.loads(response_text) if response_text else {}
                 else:
-                    result = await self._make_request(
-                        method="POST",
-                        url=url,
-                        headers=self._build_labs_request_context_headers(project_id),
-                        json_data=json_data,
-                        use_at=True,
-                        at_token=at,
-                        timeout=request_timeout,
-                        use_media_proxy=prefer_media_proxy,
-                        respect_fingerprint_proxy=not prefer_media_proxy,
-                    )
+                    result = await _submit_image_via_http()
                 if http_attempt_info is not None:
                     http_attempt_info["duration_ms"] = int((time.time() - http_attempt_started_at) * 1000)
                     http_attempt_info["success"] = True
@@ -1200,7 +1233,7 @@ class FlowClient:
         """
         url = f"{self.labs_base_url}/auth/session"
         try:
-            payload = await self._make_request(
+            return await self._make_request(
                 method="GET",
                 url=url,
                 use_st=True,
@@ -1214,7 +1247,7 @@ class FlowClient:
             debug_logger.log_warning(
                 f"[AUTH] ST->AT failed via configured proxy, retrying direct connection: {e}"
             )
-            payload = await self._make_request(
+            return await self._make_request(
                 method="GET",
                 url=url,
                 use_st=True,
@@ -1222,18 +1255,6 @@ class FlowClient:
                 timeout=self._get_control_plane_timeout(),
                 force_no_proxy=True,
             )
-
-        # next-auth 在 access_token 已过期且无法自刷新时仍返回 200，只在 body 里带
-        # error=ACCESS_TOKEN_REFRESH_NEEDED（同时对每次响应轮换 session-token cookie）。
-        # 这种会话能读出邮箱，但拿它去调 Flow/PA 接口必然 401 UNAUTHENTICATED，必须留痕，
-        # 否则现场只能看到后面“创建项目失败/HTTP Error 401”的二手报错。
-        if isinstance(payload, dict) and payload.get("error"):
-            debug_logger.log_warning(
-                f"[AUTH] ST->AT 返回会话异常标记 error={payload['error']}"
-                "（session token 仍能识别账号，但其 access_token 无法刷新，后续接口大概率 401；"
-                "需在已登录 labs.google 的浏览器中重新获取 cookie）"
-            )
-        return payload
 
     # ========== 项目管理 (使用ST) ==========
 
@@ -2704,45 +2725,8 @@ class FlowClient:
         )
         headers["Accept"] = "text/event-stream, text/event-stream"
 
-        if config.captcha_method == "browser" and project_id:
-            from .browser_captcha import BrowserCaptchaService
-
-            service = await BrowserCaptchaService.get_instance(self.db)
-            response_payload, _browser_ref, fingerprint = await service.submit_flow_request(
-                project_id=project_id,
-                action=action,
-                token_id=token_id,
-                url=url,
-                at_token=at,
-                json_data=payload,
-                timeout=self._get_video_submit_timeout(),
-            )
-            self._set_request_fingerprint(fingerprint if fingerprint else None)
-
-            status_code = int(response_payload.get("status") or 0)
-            raw_text = response_payload.get("text") or ""
-            if status_code >= 400:
-                error_reason = f"HTTP Error {status_code}"
-                parsed_body = None
-                try:
-                    parsed_body = json.loads(raw_text) if raw_text else None
-                except Exception:
-                    parsed_body = None
-                if isinstance(parsed_body, dict) and "error" in parsed_body:
-                    error_info = parsed_body["error"] or {}
-                    error_message = error_info.get("message", "")
-                    details = error_info.get("details", [])
-                    for detail in details or []:
-                        if isinstance(detail, dict) and detail.get("reason"):
-                            error_reason = detail.get("reason")
-                            break
-                    if error_message:
-                        error_reason = f"{error_reason}: {error_message}"
-                elif raw_text:
-                    error_reason = f"HTTP Error {status_code}: {raw_text[:200]}"
-                raise Exception(error_reason)
-        else:
-            raw_text = await self._make_text_request(
+        async def _submit_stream_via_http() -> str:
+            return await self._make_text_request(
                 method="POST",
                 url=url,
                 headers=headers,
@@ -2753,6 +2737,57 @@ class FlowClient:
                 apply_default_client_headers=False,
                 impersonate=self._resolve_runtime_impersonate(),
             )
+
+        if self._should_submit_in_browser(project_id):
+            from .browser_captcha import BrowserCaptchaService, BrowserSubmitUnavailable
+
+            service = await BrowserCaptchaService.get_instance(self.db)
+            response_payload = None
+            try:
+                response_payload, _browser_ref, fingerprint = await service.submit_flow_request(
+                    project_id=project_id,
+                    action=action,
+                    token_id=token_id,
+                    url=url,
+                    at_token=at,
+                    json_data=payload,
+                    timeout=self._get_video_submit_timeout(),
+                )
+            except BrowserSubmitUnavailable as submit_unavailable:
+                # 应用页拿不到 grecaptcha 时回退 HTTP 提交,与图片链路保持一致。
+                debug_logger.log_warning(
+                    f"[VIDEO] 浏览器内提交不可用,本次改用 HTTP 提交: {str(submit_unavailable)[:200]}"
+                )
+
+            if response_payload is None:
+                raw_text = await _submit_stream_via_http()
+            else:
+                self._set_request_fingerprint(fingerprint if fingerprint else None)
+
+                status_code = int(response_payload.get("status") or 0)
+                raw_text = response_payload.get("text") or ""
+                if status_code >= 400:
+                    error_reason = f"HTTP Error {status_code}"
+                    parsed_body = None
+                    try:
+                        parsed_body = json.loads(raw_text) if raw_text else None
+                    except Exception:
+                        parsed_body = None
+                    if isinstance(parsed_body, dict) and "error" in parsed_body:
+                        error_info = parsed_body["error"] or {}
+                        error_message = error_info.get("message", "")
+                        details = error_info.get("details", [])
+                        for detail in details or []:
+                            if isinstance(detail, dict) and detail.get("reason"):
+                                error_reason = detail.get("reason")
+                                break
+                        if error_message:
+                            error_reason = f"{error_reason}: {error_message}"
+                    elif raw_text:
+                        error_reason = f"HTTP Error {status_code}: {raw_text[:200]}"
+                    raise Exception(error_reason)
+        else:
+            raw_text = await _submit_stream_via_http()
         return self._parse_sse_json_events(raw_text)
 
     async def generate_omni_reference_video(

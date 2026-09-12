@@ -193,6 +193,11 @@ TOKENS_BANNED_429 = Gauge(
     "Number of tokens currently disabled because of 429 rate limit bans.",
     registry=MAIN_REGISTRY,
 )
+TOKENS_GOOGLE_COOKIES_PROBLEM = Gauge(
+    "flow2api_tokens_google_cookies_problem",
+    "Number of tokens whose Google account cookies are confirmed invalid or missing.",
+    registry=MAIN_REGISTRY,
+)
 TOKENS_CREDITS_TOTAL = Gauge(
     "flow2api_token_credits_total",
     "Sum of credits across all tokens.",
@@ -298,6 +303,12 @@ TOKEN_MISSING_AT = Gauge(
     ["token_id"],
     registry=MAIN_REGISTRY,
 )
+TOKEN_GOOGLE_COOKIES_INVALID = Gauge(
+    "flow2api_token_google_cookies_invalid",
+    "Whether a token's Google account cookies (google_cookies) are confirmed invalid.",
+    ["token_id"],
+    registry=MAIN_REGISTRY,
+)
 TOKEN_BANNED = Gauge(
     "flow2api_token_banned",
     "Whether a token is banned.",
@@ -386,6 +397,7 @@ async def update_main_runtime_metrics(db: Any, concurrency_manager: Optional[Any
     TOKEN_EXPIRED.clear()
     TOKEN_EXPIRING_SOON.clear()
     TOKEN_MISSING_AT.clear()
+    TOKEN_GOOGLE_COOKIES_INVALID.clear()
     TOKEN_BANNED.clear()
     TOKEN_CREDITS.clear()
     TOKEN_ERROR_TOTAL.clear()
@@ -396,6 +408,12 @@ async def update_main_runtime_metrics(db: Any, concurrency_manager: Optional[Any
     TOKEN_IMAGE_INFLIGHT.clear()
     TOKEN_VIDEO_INFLIGHT.clear()
 
+    # 惰性导入:core.monitoring 被 services 层引用,顶层导入 services 会形成循环导入
+    try:
+        from ..services.credential_health import google_cookie_health
+    except Exception:
+        google_cookie_health = None
+
     total_tokens = len(rows)
     active_tokens = 0
     inactive_tokens = 0
@@ -403,6 +421,7 @@ async def update_main_runtime_metrics(db: Any, concurrency_manager: Optional[Any
     expired_tokens = 0
     expiring_soon_tokens = 0
     banned_429_tokens = 0
+    google_cookies_problem_tokens = 0
     total_credits = 0
     active_total_credits = 0
     total_errors = 0
@@ -447,6 +466,21 @@ async def update_main_runtime_metrics(db: Any, concurrency_manager: Optional[Any
         if (not is_active) and ban_reason == "429_rate_limit":
             banned_429_tokens += 1
 
+        # 🆕 失效的 Google Cookies(账号态)必须显式暴露:它会同时造成
+        # “插件更新成功但后台仍显示过期”“协议刷新只报 Google 拒绝登录”
+        # 以及上游 401/403 等误导性现象。
+        cookie_problem = False
+        if google_cookie_health is not None:
+            try:
+                cookie_problem = bool(google_cookie_health.peek(row).get("problem"))
+            except Exception:
+                cookie_problem = False
+        if cookie_problem:
+            google_cookies_problem_tokens += 1
+        TOKEN_GOOGLE_COOKIES_INVALID.labels(token_id=token_id).set(
+            1.0 if cookie_problem else 0.0
+        )
+
         total_credits += credits
         total_errors += error_count
         total_today_errors += today_error_count
@@ -483,6 +517,7 @@ async def update_main_runtime_metrics(db: Any, concurrency_manager: Optional[Any
     TOKENS_EXPIRED.set(float(expired_tokens))
     TOKENS_EXPIRING_SOON.set(float(expiring_soon_tokens))
     TOKENS_BANNED_429.set(float(banned_429_tokens))
+    TOKENS_GOOGLE_COOKIES_PROBLEM.set(float(google_cookies_problem_tokens))
     TOKENS_CREDITS_TOTAL.set(float(total_credits))
     ACTIVE_TOKENS_CREDITS_TOTAL.set(float(active_total_credits))
     TOKENS_ERROR_TOTAL.set(float(total_errors))
@@ -520,11 +555,17 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
     rows = await db.get_all_tokens_with_stats()
     now = datetime.now(timezone.utc)
 
+    try:
+        from ..services.credential_health import google_cookie_health
+    except Exception:
+        google_cookie_health = None
+
     active_tokens = 0
     missing_at_tokens = 0
     expired_tokens = 0
     expiring_soon_tokens = 0
     banned_429_tokens = 0
+    google_cookies_problem_tokens = 0
 
     for row in rows:
         if bool(row.get("is_active")):
@@ -542,6 +583,14 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
         if (not bool(row.get("is_active"))) and str(row.get("ban_reason") or "").strip() == "429_rate_limit":
             banned_429_tokens += 1
 
+        # 🆕 失效/缺失的 Google Cookies 计入健康快照,便于外部巡检直接发现
+        if google_cookie_health is not None:
+            try:
+                if google_cookie_health.peek(row).get("problem"):
+                    google_cookies_problem_tokens += 1
+            except Exception:
+                pass
+
     return {
         "backend_running": True,
         "has_active_tokens": active_tokens > 0,
@@ -551,6 +600,7 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
         "tokens_expired": expired_tokens,
         "tokens_expiring_within_1h": expiring_soon_tokens,
         "banned_429_tokens": banned_429_tokens,
+        "tokens_google_cookies_problem": google_cookies_problem_tokens,
         "captcha_method": config.captcha_method,
         "remote_browser_configured": (
             config.captcha_method == "remote_browser"

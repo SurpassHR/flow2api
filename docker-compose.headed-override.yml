@@ -11,6 +11,9 @@ services:
       - ./data:/app/data
       - ./tmp:/app/tmp
       - ./config/setting.toml:/app/config/setting.toml
+      # 管理台前端(static/manage.html 等)默认烘进镜像,改一行就要重建;
+      # 挂进来后 docker compose up -d 重建容器即可生效
+      - ./static:/app/static
       # 本地补丁:browser_captcha.py 兼容 Trusted Types 与 Playwright 参数签名
       - ./src:/app/src
     logging:

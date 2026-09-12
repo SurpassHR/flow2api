@@ -28,7 +28,7 @@ from ..core.browser_runtime_status import (
     progress_runtime_prepare,
 )
 from ..core.config import config
-from .browser_cookie_utils import build_cookie_signature
+from .browser_cookie_utils import build_cookie_signature, parse_browser_cookie_payload
 
 
 # ==================== Docker 环境检测 ====================
@@ -233,11 +233,50 @@ else:
 
 # 配置
 LABS_URL = "https://labs.google/fx/tools/flow"
+# 2026-09-11:Flow 已从 labs.google 迁移到 flow.google.com(旧地址 308 永久跳转),
+# 新域名的应用页只对 .google.com 账号态开放,库内账号 cookies 失效时会被重定向到
+# accounts.google.com 登录页(永远拿不到 grecaptcha),且其 CSP 为 script-src 'nonce-...',
+# 会拦截我们注入的 enterprise.js。
+#
+# 实测结论(2026-09-11,同一 HTTP 提交只改 token 签发页):
+#   token 签发于 https://www.google.com/      -> 403 PUBLIC_ERROR_UNUSUAL_ACTIVITY
+#   token 签发于 https://labs.google/ (ST 登录态) -> 200 生成成功
+# 原因是服务端提交时固定带 Origin/Referer=https://labs.google,reCAPTCHA Enterprise
+# 会校验 token 的签发主机名,www.google.com 与之不一致即判定异常。
+# 因此中性页必须是 labs.google:NextAuth 的 session-token 能在这里生效(已登录),
+# 且该页无 CSP 拦截,可以补注入 enterprise.js。
+CAPTCHA_BOOTSTRAP_URL = "https://labs.google/"
 BROWSER_SESSION_COOKIE_TARGET_URLS = (
     "https://labs.google/",
     "https://www.google.com/",
     "https://www.recaptcha.net/",
 )
+
+# 浏览器内提交的可用性缓存:
+# 迁移到 flow.google.com 后,应用页只对登录态开放,匿名访问会被路由到营销页 /about
+# (无 grecaptcha),而且新域名 CSP 会拦截补注入脚本,此时浏览器内提交必然失败。
+# 失败一次后暂停浏览器内提交一段时间,期间直接走 HTTP 提交(由 flow_client 完成),
+# 避免每个请求都白等几轮页面预热;到点后自动重试,应用页恢复登录态即可自动切回。
+IN_BROWSER_SUBMIT_RETRY_SECONDS = 1800
+_in_browser_submit_unavailable_until: float = 0.0
+
+
+class BrowserSubmitUnavailable(RuntimeError):
+    """浏览器内提交不可用(应用页拿不到 grecaptcha),调用方应改用 HTTP 提交。"""
+
+
+def is_in_browser_submit_available() -> bool:
+    """当前是否应尝试浏览器内提交(应用页暂时不可用时返回 False)。"""
+    return time.monotonic() >= _in_browser_submit_unavailable_until
+
+
+def mark_in_browser_submit_unavailable(reason: str = "") -> None:
+    """标记浏览器内提交暂时不可用,冷却期内改走 HTTP 提交。"""
+    global _in_browser_submit_unavailable_until
+    _in_browser_submit_unavailable_until = time.monotonic() + IN_BROWSER_SUBMIT_RETRY_SECONDS
+    debug_logger.log_warning(
+        f"[BrowserCaptcha] 浏览器内提交进入 {IN_BROWSER_SUBMIT_RETRY_SECONDS}s 冷却,期间改用 HTTP 提交: {reason[:200]}"
+    )
 
 # ==========================================
 # 代理解析工具函数
@@ -853,6 +892,13 @@ class TokenBrowser:
         if target is None:
             return False
 
+        # 默认关闭(2026-09-11 实测):Object.defineProperty 覆盖 Navigator.prototype
+        # 等原生属性会被 reCAPTCHA Enterprise 识别为自动化/篡改特征,导致 token 被
+        # 上游以 PUBLIC_ERROR_UNUSUAL_ACTIVITY 拒绝。需要时可设
+        # browser_environment_patch = true 重新开启。
+        if not getattr(config, "browser_environment_patch", False):
+            return False
+
         signature = str(getattr(self, "_profile_env_seed", "") or "")
         if getattr(target, "_flow2api_environment_patch_signature", None) == signature:
             return True
@@ -1059,47 +1105,95 @@ class TokenBrowser:
             })
         return expanded
 
-    async def _load_token_session_binding(self, token_id: Optional[int]) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    async def _load_token_session_binding(
+        self, token_id: Optional[int]
+    ) -> tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
+        """读取 token 的登录态材料:(token_key, session_token, google_cookies, signature)。
+
+        signature 覆盖 ST 与 Google 账号 cookies,任一变化都会触发重新绑定。
+        """
         token_key = self._normalize_token_key(token_id)
         if token_key is None or not self.db:
-            return token_key, None, None
+            return token_key, None, None, None
 
         try:
             token = await self.db.get_token(token_key)
         except Exception as e:
             debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} 读取 token({token_key}) Session Token 失败: {e}")
-            return token_key, None, None
+            return token_key, None, None, None
 
         session_token = str(getattr(token, "st", "") or "").strip() if token else ""
-        if not session_token:
-            return token_key, None, None
+        google_cookies = str(getattr(token, "google_cookies", "") or "").strip() if token else ""
+        if not session_token and not google_cookies:
+            return token_key, None, None, None
 
-        cookie_signature = build_cookie_signature(
-            f"__Secure-next-auth.session-token={session_token}"
-        ) or hashlib.sha256(session_token.encode("utf-8")).hexdigest()
-        return token_key, session_token, cookie_signature
+        signature_source = (
+            f"__Secure-next-auth.session-token={session_token}|google_cookies={google_cookies}"
+        )
+        cookie_signature = build_cookie_signature(signature_source) or hashlib.sha256(
+            signature_source.encode("utf-8")
+        ).hexdigest()
+        return token_key, session_token, google_cookies, cookie_signature
+
+    @staticmethod
+    def _build_google_account_cookie_targets(raw_cookie: Any) -> List[Dict[str, Any]]:
+        """把 token.google_cookies 解析成浏览器 cookie(默认挂到 .google.com 域)。
+
+        新域名 flow.google.com 使用 Google 账号态(cookies)渲染应用页,
+        因此需要把账号 cookies 注入打码浏览器,让应用页以登录态打开。
+        """
+        targets: List[Dict[str, Any]] = []
+        for cookie in parse_browser_cookie_payload(raw_cookie, default_url="https://www.google.com/"):
+            name = str(cookie.get("name") or "").strip()
+            if not name:
+                continue
+            entry: Dict[str, Any] = {
+                "name": name,
+                "value": str(cookie.get("value") or ""),
+                "path": "/",
+                "domain": str(cookie.get("domain") or "").strip() or ".google.com",
+                "secure": True,
+                "httpOnly": bool(cookie.get("httpOnly", True)),
+            }
+            same_site = cookie.get("sameSite")
+            entry["sameSite"] = same_site if same_site in ("Strict", "Lax", "None") else "None"
+            targets.append(entry)
+        return targets
 
     async def _ensure_shared_token_binding(self, context, token_id: Optional[int]) -> bool:
-        # 本地补丁:跳过登录态绑定。带登录 cookie 打开 labs.google/fx/tools/flow 会被
-        # 间歇性重定向到 flow.google.com/about(该页无 grecaptcha),导致打码必败;
-        # reCAPTCHA Enterprise 打码为匿名执行,不依赖账号登录态。
-        # 注意:仍需记录绑定标记,否则 token_changed 检查会误判为绑定变化,
-        # 导致每次打码/重试都重建浏览器(launches 累加、打码变慢、更容易触发上游限流)。
-        self._shared_bound_token_id = self._normalize_token_key(token_id)
-        self._shared_bound_cookie_signature = None
-        return True
-        token_key, session_token, cookie_signature = await self._load_token_session_binding(token_id)
+        """把业务 token 的登录态绑定到共享浏览器 context。
+
+        2026-09-11:Flow 迁移到 flow.google.com 后,应用页只对登录态开放,
+        匿名访问会被路由到营销页 /about(无 grecaptcha),此时签发的打码 token 会被
+        上游以 PUBLIC_ERROR_UNUSUAL_ACTIVITY(reCAPTCHA evaluation failed) 拒绝。
+        因此恢复登录态绑定,并把 token.google_cookies(Google 账号态)一并注入浏览器,
+        让应用页以登录态渲染、打码与提交回到正确上下文。
+
+        可用 browser_bind_login_state = false 关闭绑定(回到纯匿名打码)。
+        注意:即使跳过绑定也要记录绑定标记,否则 token_changed 检查会误判为绑定变化,
+        导致每次打码/重试都重建浏览器(launches 累加、打码变慢、更容易触发上游限流)。
+        """
+        token_key, session_token, google_cookies, cookie_signature = await self._load_token_session_binding(token_id)
+
+        if not config.browser_bind_login_state:
+            self._shared_bound_token_id = token_key
+            self._shared_bound_cookie_signature = None
+            return True
 
         if token_key is None:
             self._shared_bound_token_id = None
             self._shared_bound_cookie_signature = None
             return True
 
-        if not session_token or not cookie_signature:
+        if not cookie_signature:
+            # 没有可用的登录态:退回匿名打码,而不是让整个打码链路失败。
             debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} 缺少可用的 Session Token，无法绑定账号态 (token_id={token_key})"
+                f"[BrowserCaptcha] Token-{self.token_id} 缺少可用的登录态(ST/Google Cookies)，本次按匿名打码 "
+                f"(token_id={token_key})"
             )
-            return False
+            self._shared_bound_token_id = token_key
+            self._shared_bound_cookie_signature = None
+            return True
 
         if (
             self._shared_bound_token_id == token_key
@@ -1107,12 +1201,16 @@ class TokenBrowser:
         ):
             return True
 
+        account_cookies = self._build_google_account_cookie_targets(google_cookies)
         browser_cookies = self._build_token_session_cookie_targets(session_token)
+        browser_cookies.extend(account_cookies)
         if not browser_cookies:
             debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} 构造 Session Token cookies 失败 (token_id={token_key})"
+                f"[BrowserCaptcha] Token-{self.token_id} 构造登录态 cookies 失败 (token_id={token_key})"
             )
-            return False
+            self._shared_bound_token_id = token_key
+            self._shared_bound_cookie_signature = None
+            return True
 
         try:
             await context.clear_cookies()
@@ -1121,7 +1219,8 @@ class TokenBrowser:
             self._shared_bound_cookie_signature = cookie_signature
             debug_logger.log_info(
                 f"[BrowserCaptcha] Token-{self.token_id} 已绑定业务 token 登录态到共享 context "
-                f"(token_id={token_key}, cookies={len(browser_cookies)})"
+                f"(token_id={token_key}, cookies={len(browser_cookies)}, "
+                f"其中 Google 账号 cookies={len(account_cookies)})"
             )
             return True
         except Exception as e:
@@ -1129,7 +1228,9 @@ class TokenBrowser:
                 f"[BrowserCaptcha] Token-{self.token_id} 绑定业务 token 登录态失败 "
                 f"(token_id={token_key}): {type(e).__name__}: {str(e)[:200]}"
             )
-            return False
+            self._shared_bound_token_id = token_key
+            self._shared_bound_cookie_signature = None
+            return True
 
     async def _prepare_flow_runtime_page(
         self,
@@ -1139,6 +1240,7 @@ class TokenBrowser:
         action: str,
         *,
         context_label: str = "",
+        allow_bootstrap_fallback: bool = False,
     ) -> bool:
         """打开真实 Flow 页面并完成页面预热。"""
         primary_host = "https://www.recaptcha.net" if self._browser_proxy_active else "https://www.google.com"
@@ -1146,27 +1248,9 @@ class TokenBrowser:
         page_urls = [LABS_URL, self._build_flow_project_url(project_id)]
         label = f"{context_label} " if context_label else ""
 
-        # 防跳转:Google 会间歇性把登录用户重定向到 flow.google.com/about(该页无 grecaptcha),
-        # 拦截打码页面的顶层导航,强制留在 labs.google 域
-        try:
-            async def _block_flow_redirect(route):
-                try:
-                    req = route.request
-                    if req.is_navigation_request() and req.frame.parent_frame is None:
-                        debug_logger.log_warning(
-                            f"[BrowserCaptcha] Token-{self.token_id} {label}已拦截跳转: {req.url[:120]}"
-                        )
-                        await route.abort()
-                    else:
-                        await route.continue_()
-                except Exception:
-                    try:
-                        await route.continue_()
-                    except Exception:
-                        pass
-            await page.route("https://flow.google.com/**", _block_flow_redirect)
-        except Exception:
-            pass
+        # 2026-09-11 移除原「拦截 flow.google.com 顶层导航」补丁:
+        # labs.google/fx/tools/flow 已 308 永久跳转到 flow.google.com(新域名即正式站点),
+        # 继续拦截反而会挡掉正确域名。
 
         loaded = False
         last_error: Optional[str] = None
@@ -1190,64 +1274,106 @@ class TokenBrowser:
             )
             return False
 
-        page_loaded = False
-        for _ in range(20):
+        # 2026-09-11:flow.google.com 认的是 .google.com 账号 cookies。库内账号态失效时,
+        # 真实应用页会被重定向到 accounts.google.com 登录页,而登录页永远没有 grecaptcha。
+        # 提前识别这种情况,跳过 readyState/预热/2×15s 等待(约 45s),直接走中性页兜底。
+        try:
+            landed_host = (urlparse(page.url).hostname or "").lower()
+        except Exception:
+            landed_host = ""
+        hit_google_login = landed_host.endswith("accounts.google.com")
+
+        if hit_google_login:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}真实应用页被重定向到 Google 登录页 "
+                f"(当前 context 无 flow.google.com 登录态): {page.url[:180]}"
+            )
+            ready = False
+        else:
+            page_loaded = False
+            for _ in range(20):
+                try:
+                    ready_state = await page.evaluate("document.readyState")
+                    if ready_state == "complete":
+                        page_loaded = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+            if not page_loaded:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] Token-{self.token_id} {label}Flow 页面 readyState 未达到 complete，继续尝试预热"
+                )
+
             try:
-                ready_state = await page.evaluate("document.readyState")
-                if ready_state == "complete":
-                    page_loaded = True
-                    break
+                await page.bring_to_front()
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
-        if not page_loaded:
-            debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} {label}Flow 页面 readyState 未达到 complete，继续尝试预热"
+
+            try:
+                await page.mouse.move(320, 220)
+                await page.mouse.move(560, 360, steps=16)
+                await page.mouse.wheel(0, 260)
+                await page.evaluate(
+                    """
+                    (() => {
+                        try {
+                            window.focus();
+                            window.dispatchEvent(new Event('focus'));
+                            document.dispatchEvent(new MouseEvent('mousemove', {
+                                bubbles: true,
+                                clientX: Math.max(32, Math.floor((window.innerWidth || 1280) * 0.42)),
+                                clientY: Math.max(32, Math.floor((window.innerHeight || 720) * 0.36))
+                            }));
+                            window.scrollTo(0, Math.min(320, document.body?.scrollHeight || 320));
+                        } catch (e) {}
+                    })()
+                    """
+                )
+            except Exception:
+                pass
+
+            warmup_seconds = float(getattr(config, "browser_flow_page_warmup_seconds", 6) or 6)
+            if warmup_seconds > 0:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] Token-{self.token_id} {label}真实页面预热 {warmup_seconds:.1f}s"
+                )
+                await asyncio.sleep(warmup_seconds)
+
+            ready = await self._wait_for_enterprise_ready(
+                page,
+                website_key,
+                primary_host,
+                secondary_host,
+                timeout_ms=15000,
+                context_label=f"{label}真实页面",
             )
-
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
-
-        try:
-            await page.mouse.move(320, 220)
-            await page.mouse.move(560, 360, steps=16)
-            await page.mouse.wheel(0, 260)
-            await page.evaluate(
-                """
-                (() => {
-                    try {
-                        window.focus();
-                        window.dispatchEvent(new Event('focus'));
-                        document.dispatchEvent(new MouseEvent('mousemove', {
-                            bubbles: true,
-                            clientX: Math.max(32, Math.floor((window.innerWidth || 1280) * 0.42)),
-                            clientY: Math.max(32, Math.floor((window.innerHeight || 720) * 0.36))
-                        }));
-                        window.scrollTo(0, Math.min(320, document.body?.scrollHeight || 320));
-                    } catch (e) {}
-                })()
-                """
-            )
-        except Exception:
-            pass
-
-        warmup_seconds = float(getattr(config, "browser_flow_page_warmup_seconds", 6) or 6)
-        if warmup_seconds > 0:
-            debug_logger.log_info(
-                f"[BrowserCaptcha] Token-{self.token_id} {label}真实页面预热 {warmup_seconds:.1f}s"
-            )
-            await asyncio.sleep(warmup_seconds)
-
-        ready = await self._wait_for_enterprise_ready(
-            page,
-            website_key,
-            primary_host,
-            secondary_host,
-            timeout_ms=15000,
-            context_label=f"{label}真实页面",
-        )
+        if not ready and allow_bootstrap_fallback:
+            # 中性页兜底:在 labs.google(带 NextAuth 登录态、无 CSP 限制)上签发 token,
+            # 使其主机名与提交请求的 Origin/Referer(https://labs.google)一致。
+            bootstrap_url = (getattr(config, "browser_captcha_bootstrap_url", "") or CAPTCHA_BOOTSTRAP_URL).strip()
+            if bootstrap_url:
+                try:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] Token-{self.token_id} {label}应用页无法提供 grecaptcha"
+                        f"(无登录态被重定向到登录页 / 匿名 /about 且 CSP 拦截脚本注入),回退中性页面: {bootstrap_url}"
+                    )
+                    await page.goto(bootstrap_url, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(1.5)
+                    ready = await self._wait_for_enterprise_ready(
+                        page,
+                        website_key,
+                        primary_host,
+                        secondary_host,
+                        timeout_ms=20000,
+                        context_label=f"{label}中性页",
+                    )
+                except Exception as bootstrap_error:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] Token-{self.token_id} {label}中性页回退失败: "
+                        f"{type(bootstrap_error).__name__}: {str(bootstrap_error)[:180]}"
+                    )
+                    ready = False
         if not ready:
             return False
 
@@ -1366,9 +1492,16 @@ class TokenBrowser:
                 proxy=proxy_option,
                 args=browser_args,
             )
+            masked_user_agent = self._resolve_headless_user_agent(browser, headless)
+            if masked_user_agent:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] Token-{self.token_id} headless UA 已抹除 HeadlessChrome 标记: "
+                    f"{masked_user_agent[:110]}"
+                )
             context = await browser.new_context(
                 viewport=viewport,
                 locale="en-US",
+                user_agent=masked_user_agent,
             )
             await self._apply_browser_environment_patch(context, label="context")
             browser_pid = self._extract_browser_pid(browser)
@@ -1388,6 +1521,28 @@ class TokenBrowser:
             if manage_slot_pid:
                 self._write_pid_file(None)
             raise
+
+    def _resolve_headless_user_agent(self, browser, headless: bool) -> Optional[str]:
+        """无头浏览器默认 UA 带 ``HeadlessChrome``,reCAPTCHA 会据此判定为自动化流量。
+
+        2026-09-11:上游报 PUBLIC_ERROR_UNUSUAL_ACTIVITY(reCAPTCHA evaluation failed),
+        而日志里打码浏览器 UA 是 ``HeadlessChrome/151``。这里只把 ``Headless`` 标记去掉,
+        平台(用本机 Linux)与 Chrome 主版本号保持真实,避免自相矛盾。
+        可用 browser_mask_headless_ua = false 关闭。
+        """
+        if not headless or not config.browser_mask_headless_ua:
+            return None
+        try:
+            raw_version = str(getattr(browser, "version", "") or "").strip()
+        except Exception:
+            raw_version = ""
+        major = raw_version.split(".")[0] if raw_version else ""
+        if not major.isdigit():
+            major = "151"
+        return (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{major}.0.0.0 Safari/537.36"
+        )
 
     async def _recycle_browser_locked(self, reason: str = "unknown", rotate_profile: bool = True):
         """Recycle the shared browser instance and reset its state."""
@@ -1866,6 +2021,7 @@ class TokenBrowser:
                 website_key,
                 action,
                 context_label="打码",
+                allow_bootstrap_fallback=True,
             )
             if not ready:
                 return None
@@ -2260,7 +2416,11 @@ class TokenBrowser:
                             timeout=solve_timeout,
                         )
                         if not ready:
-                            raise RuntimeError("grecaptcha.enterprise 未就绪")
+                            # 应用页拿不到 grecaptcha(如域名迁移后匿名被路由到 /about),
+                            # 直接交给调用方改走 HTTP 提交,不再原地重试浪费打码时间。
+                            raise BrowserSubmitUnavailable(
+                                "应用页 grecaptcha 未就绪,浏览器内提交不可用"
+                            )
 
                         payload_for_submit = deepcopy(json_data)
                         response_payload = await asyncio.wait_for(
@@ -2361,6 +2521,11 @@ class TokenBrowser:
                             f"launches={self._shared_launch_count}, reuse={self._shared_reuse_count})"
                         )
                         return response_payload
+                    except BrowserSubmitUnavailable as submit_unavailable:
+                        # 应用页不可用属于环境问题,重试无意义:标记冷却并向上抛,
+                        # 由 flow_client 回退到 HTTP 提交。
+                        mark_in_browser_submit_unavailable(str(submit_unavailable))
+                        raise
                     except Exception as e:
                         self._error_count += 1
                         self._consecutive_browser_failures += 1
@@ -3100,19 +3265,25 @@ class BrowserCaptchaService:
             await self._release_slot_reservation(browser_id)
 
     async def report_error(self, browser_ref: Optional[Union[int, str]] = None, error_reason: Optional[str] = None):
-        """Handle upstream errors; recycle the browser only for explicit reCAPTCHA evaluation failures."""
+        """Handle upstream errors; recycle the browser only for explicit reCAPTCHA evaluation failures.
+
+        2026-09-11:上游 reCAPTCHA evaluation failed(PUBLIC_ERROR_UNUSUAL_ACTIVITY) 说明
+        token 的签发上下文不对,不是浏览器坏了;重建浏览器要 1-2 分钟、还会把 1GB 小机器
+        拖到高负载。因此默认不再因该原因重建浏览器(可用 browser_recaptcha_failure_recycle
+        = true 恢复旧行为)。
+        """
         browser_id, _ = self._parse_browser_ref(browser_ref)
 
         async with self._browsers_lock:
             browser = self._browsers.get(browser_id) if browser_id is not None else None
             error_lower = (error_reason or "").lower()
             has_recaptcha = "recaptcha" in error_lower
-            should_recycle = has_recaptcha and (
+            should_recycle = has_recaptcha and config.browser_recaptcha_failure_recycle and (
                 "evaluation failed" in error_lower
                 or "verification failed" in error_lower or "验证失败" in (error_reason or "")
                 or "failed" in error_lower
             )
-            if should_recycle:
+            if has_recaptcha:
                 self._stats["api_403"] += 1
             if browser_id is not None:
                 debug_logger.log_info(

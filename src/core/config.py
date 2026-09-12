@@ -457,6 +457,15 @@ class Config:
             return 3.0
 
     @property
+    def browser_captcha_submit_in_browser(self) -> bool:
+        """browser 模式是否在浏览器内提交生成请求。
+
+        True(默认):优先在打码浏览器里 fetch,拿不到 grecaptcha 时自动回退 HTTP 提交。
+        False:始终走服务端 HTTP 提交(打码仍由内置浏览器完成)。
+        """
+        return bool(self._config.get("captcha", {}).get("browser_captcha_submit_in_browser", True))
+
+    @property
     def browser_idle_ttl_seconds(self) -> int:
         value = self._config.get("captcha", {}).get("browser_idle_ttl_seconds", 600)
         try:
@@ -475,12 +484,53 @@ class Config:
 
     @property
     def browser_captcha_generation_retries(self) -> int:
-        """生成接口因 reCAPTCHA 评估失败时允许的总重试次数。"""
-        value = self._config.get("captcha", {}).get("browser_captcha_generation_retries", 6)
+        """生成接口因 reCAPTCHA 评估失败时允许的总重试次数。
+
+        每次重试都要重新打码(数十秒到两分钟),默认值不宜大:上下文类失败重试也过不了。
+        """
+        value = self._config.get("captcha", {}).get("browser_captcha_generation_retries", 3)
         try:
             return max(1, min(20, int(value)))
         except Exception:
-            return 6
+            return 3
+
+    @property
+    def browser_mask_headless_ua(self) -> bool:
+        """无头浏览器是否把 UA 里的 ``HeadlessChrome`` 标记抹掉。
+
+        默认 True:上游会把 HeadlessChrome 当成自动化流量,导致 reCAPTCHA 评估失败
+        (PUBLIC_ERROR_UNUSUAL_ACTIVITY)。
+        """
+        return bool(self._config.get("captcha", {}).get("browser_mask_headless_ua", True))
+
+    @property
+    def browser_recaptcha_failure_recycle(self) -> bool:
+        """上游报 reCAPTCHA evaluation failed 时是否重建打码浏览器。
+
+        默认 False:token 被拒是签发上下文问题,重建浏览器只会白耗 1-2 分钟。
+        """
+        return bool(self._config.get("captcha", {}).get("browser_recaptcha_failure_recycle", False))
+
+    @property
+    def browser_environment_patch(self) -> bool:
+        """是否向打码浏览器注入 navigator/screen/window 环境补齐脚本。
+
+        默认 False(2026-09-11 实测结论):该脚本用 Object.defineProperty 覆盖
+        Navigator.prototype 等原生属性,reCAPTCHA Enterprise 会将其识别为篡改/
+        自动化特征,即使 token 签发在正确的 labs.google 上也会被上游以
+        PUBLIC_ERROR_UNUSUAL_ACTIVITY 拒绝。关闭后真实生图恢复正常。
+        navigator.webdriver 仍由单独的轻量覆盖脚本处理,不受此开关影响。
+        """
+        return bool(self._config.get("captcha", {}).get("browser_environment_patch", False))
+
+    @property
+    def browser_bind_login_state(self) -> bool:
+        """browser 模式是否把账号登录态(ST + Google cookies)注入打码浏览器。
+
+        默认 True:flow.google.com 的应用页只对登录态开放,匿名只能拿到无 grecaptcha 的
+        /about,会导致打码 token 被上游以 PUBLIC_ERROR_UNUSUAL_ACTIVITY 拒绝。
+        """
+        return bool(self._config.get("captcha", {}).get("browser_bind_login_state", True))
 
     @property
     def browser_captcha_solve_timeout(self) -> int:
@@ -490,6 +540,208 @@ class Config:
             return max(30, int(value))
         except Exception:
             return 150
+
+    @property
+    def browser_captcha_bootstrap_url(self) -> str:
+        """打码 token 获取用的中性页面(无 CSP 限制,可注入 enterprise.js)。
+
+        必须是 https://labs.google/ 一类与提交请求 Origin/Referer 同源的页面:
+        reCAPTCHA Enterprise 会校验 token 的签发主机名,签发在 www.google.com 上会
+        被上游以 PUBLIC_ERROR_UNUSUAL_ACTIVITY 拒绝(2026-09-11 实测)。
+        """
+        value = self._config.get("captcha", {}).get("browser_captcha_bootstrap_url", "https://labs.google/")
+        return str(value or "").strip()
+
+    @property
+    def google_cookie_health_check_enabled(self) -> bool:
+        """是否启用 Google Cookies(账号态)健康巡检。
+
+        默认 True:失效的 google_cookies 会造成一连串误导性假象(ST→AT 仍能返回用户、
+        应用页被 302 到 accounts.google.com、协议刷新只报“Google 拒绝登录”、
+        上游 401/403),因此需要主动给出一致结论并在后台告警。
+        """
+        return bool(self._config.get("captcha", {}).get("google_cookie_health_check_enabled", True))
+
+    @property
+    def google_cookie_health_check_ttl_seconds(self) -> int:
+        """Google Cookies 健康结论的缓存时长(秒)，到期后重新探测。"""
+        value = self._config.get("captcha", {}).get("google_cookie_health_check_ttl_seconds", 600)
+        try:
+            return max(30, int(value))
+        except Exception:
+            return 600
+
+    @property
+    def google_cookie_health_check_timeout_seconds(self) -> int:
+        """单次 Google Cookies 探测请求超时(秒)。"""
+        value = self._config.get("captcha", {}).get("google_cookie_health_check_timeout_seconds", 12)
+        try:
+            return max(3, int(value))
+        except Exception:
+            return 12
+
+    @property
+    def google_cookie_health_probe_url(self) -> str:
+        """Google Cookies 探测地址(默认需登录才能访问的 myaccount.google.com)。"""
+        value = self._config.get("captcha", {}).get(
+            "google_cookie_health_probe_url", "https://myaccount.google.com/"
+        )
+        return str(value or "").strip() or "https://myaccount.google.com/"
+
+    @property
+    def google_cookie_health_sweep_interval_seconds(self) -> int:
+        """后台巡检间隔(秒)。"""
+        value = self._config.get("captcha", {}).get("google_cookie_health_sweep_interval_seconds", 300)
+        try:
+            return max(30, int(value))
+        except Exception:
+            return 300
+
+    # ---------------------------------------------------------------- 凭证浏览器
+    # 服务器自持登录态:用持久 profile 的 Chromium 自己维持并提取 ST/账号 Cookie,
+    # 使服务器不必依赖本地浏览器插件持续推送。详见 services/credential_keeper.py。
+
+    @property
+    def credential_keeper_enabled(self) -> bool:
+        """是否启用服务器自持凭证浏览器。
+
+        默认 False:它会额外拉起一个 Chromium,只适合确实想摆脱本地插件的部署。
+        """
+        return bool(self._config.get("credential_keeper", {}).get("enabled", False))
+
+    @property
+    def credential_keeper_interval_seconds(self) -> int:
+        """后台自持刷新间隔(秒)。"""
+        value = self._config.get("credential_keeper", {}).get("interval_seconds", 1800)
+        try:
+            return max(120, int(value))
+        except Exception:
+            return 1800
+
+    @property
+    def credential_keeper_startup_delay_seconds(self) -> int:
+        """启动后延迟多久才做第一次自持刷新(秒),避开启动期的打码预热。"""
+        value = self._config.get("credential_keeper", {}).get("startup_delay_seconds", 30)
+        try:
+            return max(0, int(value))
+        except Exception:
+            return 30
+
+    @property
+    def credential_keeper_headless(self) -> bool:
+        """凭证浏览器是否无头运行。
+
+        默认 False:有头(配合 DISPLAY/Xvfb)才能让管理台的截图转发真正用于完成登录。
+        """
+        return bool(self._config.get("credential_keeper", {}).get("headless", False))
+
+    @property
+    def credential_keeper_profile_dir(self) -> str:
+        """持久 profile 目录。指向 bind-mount 目录即可在容器重建后保留登录态。"""
+        return str(self._config.get("credential_keeper", {}).get("profile_dir", "") or "").strip()
+
+    @property
+    def credential_keeper_target_url(self) -> str:
+        """用于判定登录态并读取 cookie 的页面。"""
+        value = self._config.get("credential_keeper", {}).get(
+            "target_url", "https://labs.google/fx/tools/flow"
+        )
+        return str(value or "").strip()
+
+    @property
+    def credential_keeper_auto_write(self) -> bool:
+        """提取到凭证后是否自动写库(关闭则只提取、不覆盖现有 Token)。"""
+        return bool(self._config.get("credential_keeper", {}).get("auto_write", True))
+
+    @property
+    def credential_keeper_token_id(self) -> int:
+        """凭证写回的目标 Token ID;0 表示自动选择第一个启用中的 Token。"""
+        value = self._config.get("credential_keeper", {}).get("token_id", 0)
+        try:
+            return max(0, int(value))
+        except Exception:
+            return 0
+
+    @property
+    def credential_keeper_remote_control_enabled(self) -> bool:
+        """是否启用管理台的截图/输入转发(服务器上直接完成一次性登录)。"""
+        return bool(self._config.get("credential_keeper", {}).get("remote_control_enabled", True))
+
+    @property
+    def credential_keeper_disable_passkey(self) -> bool:
+        """是否让凭证浏览器的页面用不到通行密钥(passkey)。
+
+        默认 True:服务器上的 Chromium 没有任何可用认证器,页面一旦真的发起
+        WebAuthn 请求,Chrome 会弹出的原生选择窗口在 Xvfb 里无人可点,而且它是模态的,
+        页面从此收不到鼠标/键盘事件,登录就永远卡在“Verifying it's you…”。
+        关掉后 Google 会直接退回密码/验证码等可用方式。
+        """
+        return bool(self._config.get("credential_keeper", {}).get("disable_passkey", True))
+
+    @property
+    def credential_keeper_skip_when_captcha_busy(self) -> bool:
+        """打码任务进行中时跳过本轮自持刷新,避免小内存机器上两个 Chromium 抢资源。"""
+        return bool(self._config.get("credential_keeper", {}).get("skip_when_captcha_busy", True))
+
+    @property
+    def credential_keeper_hydrate_from_db(self) -> bool:
+        """启动时是否把库里的 ST/账号 Cookie 注入持久 profile(两者互为容错)。
+
+        默认 True:profile 丢失时用库补齐;库里失效时由 profile 重新提取覆盖。
+        注入不代表会话有效,真正写库前仍会 ST→AT 验证。
+        """
+        return bool(self._config.get("credential_keeper", {}).get("hydrate_from_db", True))
+
+    @property
+    def credential_keeper_push_cookies_to_protocol(self) -> bool:
+        """提取到账号 Cookie 后是否立即回灌给 protocol_mode 的协议刷新路径。
+
+        默认 True:让“浏览器自持”与“纯 HTTP 协议自续期”互为备份——
+        新鲜 Cookie 一到就立刻重算 Cookie 体检并马上跑一次协议刷新,
+        而不是等最多 refresh_interval_minutes 分钟后的下一次调度。
+        """
+        return bool(
+            self._config.get("credential_keeper", {}).get("push_cookies_to_protocol", True)
+        )
+
+    @property
+    def credential_keeper_harvest_account_cookies(self) -> bool:
+        """每轮提取前是否先让浏览器去 accounts.google.com/myaccount 走一趟。
+
+        默认 True:__Secure-*PSIDTS(会话轮转时间戳)、__Secure-STRP、OSID 这些
+        账号态 Cookie 是访问时下发/轮转的;不续期就会慢慢变旧,出现"浏览器里
+        还登录着、拉平成 HTTP 头却被 302 回登录页"的假象。
+        """
+        return bool(
+            self._config.get("credential_keeper", {}).get("harvest_account_cookies", True)
+        )
+
+    @property
+    def credential_keeper_needs_login_retry_seconds(self) -> int:
+        """未登录状态下的重试间隔(秒),用于用户完成登录后尽快自动生效。"""
+        value = self._config.get("credential_keeper", {}).get("needs_login_retry_seconds", 300)
+        try:
+            return max(60, int(value))
+        except Exception:
+            return 300
+
+    @property
+    def credential_keeper_min_free_mb(self) -> int:
+        """可用内存低于该值(MB)时跳过本轮自持刷新;0 表示不限制。"""
+        value = self._config.get("credential_keeper", {}).get("min_free_mb", 150)
+        try:
+            return max(0, int(value))
+        except Exception:
+            return 150
+
+    @property
+    def credential_keeper_nav_timeout_seconds(self) -> int:
+        """凭证浏览器单次导航超时(秒)。"""
+        value = self._config.get("credential_keeper", {}).get("nav_timeout_seconds", 45)
+        try:
+            return max(10, int(value))
+        except Exception:
+            return 45
 
     @property
     def browser_captcha_max_busy_seconds(self) -> int:

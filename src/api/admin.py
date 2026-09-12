@@ -2,7 +2,7 @@
 import asyncio
 import importlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -29,6 +29,8 @@ from ..core.monitoring import build_public_health_snapshot
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
+from ..services.credential_health import google_cookie_health, status_label as cookie_status_label
+from ..services.credential_keeper import BrowserNotOpen
 
 try:
     import httpx
@@ -56,6 +58,41 @@ def _mask_token(token: Optional[str]) -> str:
     if len(token) <= 24:
         return token
     return f"{token[:18]}...{token[-8:]}"
+
+
+def _google_cookie_health_fields(row: Any) -> Dict[str, Any]:
+    """把 Google Cookies 健康结论暴露给管理台。
+
+    失效的 google_cookies 会造成一连串误导性现象(插件提示更新成功但后台仍显示过期、
+    协议刷新只报“Google 拒绝登录”、上游 401/403)，因此这里给出统一结论，
+    同时触发一次非阻塞的后台探测，并在后台日志中明确告警。
+    """
+    fields: Dict[str, Any] = {
+        "google_cookies_status": "unchecked",
+        "google_cookies_status_label": cookie_status_label("unchecked"),
+        "google_cookies_status_detail": "尚未检查",
+        "google_cookies_checked_at": None,
+        "google_cookies_problem": False,
+    }
+    try:
+        # 非阻塞:结论过期时排入后台探测队列
+        google_cookie_health.schedule(row)
+        health = google_cookie_health.peek(row)
+    except Exception as exc:
+        fields["google_cookies_status_detail"] = f"健康检查异常: {exc}"
+        return fields
+
+    fields.update(
+        {
+            "google_cookies_status": health.get("status") or "unchecked",
+            "google_cookies_status_label": health.get("label")
+            or cookie_status_label(health.get("status") or "unchecked"),
+            "google_cookies_status_detail": health.get("detail") or "",
+            "google_cookies_checked_at": health.get("checked_at"),
+            "google_cookies_problem": bool(health.get("problem")),
+        }
+    )
+    return fields
 
 
 def _truncate_text(text: Any, limit: int = 240) -> str:
@@ -835,6 +872,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "extension_route_key": row.get("extension_route_key") or "",
         "protocol_mode": row.get("protocol_mode") or "session",
         "google_cookies": row.get("google_cookies") or "",
+        **_google_cookie_health_fields(row),  # 🆕 Google Cookies 健康结论(失效时明确告警)
         "login_account": row.get("login_account") or "",
         "login_password": row.get("login_password") or "",
         "proxy_url": row.get("proxy_url") or "",
@@ -891,6 +929,9 @@ async def add_token(
                 image_concurrency=new_token.image_concurrency,
                 video_concurrency=new_token.video_concurrency
             )
+
+        # 🆕 新Token入库后立即体检 Google Cookies,失效时后台直接告警
+        google_cookie_health.schedule(new_token, force=True, reason="admin-add")
 
         return {
             "success": True,
@@ -964,6 +1005,11 @@ async def update_token(
                     image_concurrency=updated_token.image_concurrency,
                     video_concurrency=updated_token.video_concurrency
                 )
+
+        # 🆕 Google Cookies 可能刚被替换,旧结论作废并立即重新体检
+        health_target = await token_manager.get_token(token_id)
+        if health_target:
+            google_cookie_health.schedule(health_target, force=True, reason="admin-update")
 
         return {"success": True, "message": "Token更新成功"}
     except Exception as e:
@@ -1072,6 +1118,275 @@ async def refresh_at(
     except Exception as e:
         debug_logger.log_error(f"[API] 刷新AT异常: {str(e)}")
         raise HTTPException(status_code=500, detail=f"刷新AT失败: {str(e)}")
+
+
+@router.post("/api/tokens/{token_id}/check-google-cookies")
+async def check_google_cookies(
+    token_id: int,
+    token: str = Depends(verify_admin_token)
+):
+    """立即探测该 Token 的 Google Cookies(账号态)是否仍处于登录态 🆕
+
+    失效的 google_cookies 会让 flow.google.com 应用页无法登录、协议模式刷新必然失败，
+    并让上游返回 401/403——这些现象容易被误认成打码或 token 签发源问题，
+    因此这里给出明确结论。
+    """
+    from ..core.logger import debug_logger
+
+    target = await token_manager.get_token(token_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Token不存在")
+
+    result = await google_cookie_health.check_token(target, reason="admin-manual")
+    debug_logger.log_info(
+        f"[API] 手动检查 Google Cookies: token_id={token_id}, "
+        f"status={result.get('status')}, detail={result.get('detail')}"
+    )
+    return {
+        "success": True,
+        "token_id": token_id,
+        "email": getattr(target, "email", "") or "",
+        "google_cookies_status": result.get("status"),
+        "google_cookies_status_label": result.get("label"),
+        "google_cookies_status_detail": result.get("detail"),
+        "google_cookies_checked_at": result.get("checked_at"),
+        "google_cookies_problem": bool(result.get("problem")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 服务器自持凭证浏览器(credential keeper)
+#
+# 目的:让服务器自己维持登录态并从自己的浏览器里提取 ST/.google.com Cookie,
+# 从而摆脱“必须由本地浏览器插件持续推送”的依赖。首次登录直接在服务器上完成:
+# 拉 /screenshot 看画面,用 /click、/type、/key、/goto 转发输入。
+# ---------------------------------------------------------------------------
+
+
+class CredentialKeeperClickRequest(BaseModel):
+    x: int
+    y: int
+    double: bool = False
+
+
+class CredentialKeeperTypeRequest(BaseModel):
+    text: str
+    enter: bool = False
+
+
+class CredentialKeeperKeyRequest(BaseModel):
+    key: str
+
+
+class CredentialKeeperGotoRequest(BaseModel):
+    url: str
+
+
+class CredentialKeeperScrollRequest(BaseModel):
+    dy: int = 400
+
+
+class CredentialKeeperSelectPageRequest(BaseModel):
+    index: int
+
+
+class CredentialKeeperLoginWindowRequest(BaseModel):
+    url: Optional[str] = None
+
+
+class CredentialKeeperRefreshRequest(BaseModel):
+    token_id: Optional[int] = None
+    write_db: Optional[bool] = None
+
+
+def _credential_keeper():
+    from ..services.credential_keeper import credential_keeper
+
+    return credential_keeper.configure(db, token_manager)
+
+
+def _require_remote_control() -> None:
+    if not config.credential_keeper_remote_control_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="凭证浏览器远程控制已禁用(credential_keeper.remote_control_enabled = false)",
+        )
+
+
+@router.get("/api/credential-keeper/status")
+async def credential_keeper_status(token: str = Depends(verify_admin_token)):
+    """凭证浏览器当前状态(登录态、profile、上次提取结果等)。"""
+    return _credential_keeper().status()
+
+
+@router.post("/api/credential-keeper/start")
+async def credential_keeper_start(token: str = Depends(verify_admin_token)):
+    """启动后台自持刷新循环(不依赖配置项即可临时拉起)。"""
+    keeper = _credential_keeper()
+    result = keeper.force_start(token_manager)
+    return {"success": True, "message": result.get("message"), "status": keeper.status()}
+
+
+@router.post("/api/credential-keeper/stop")
+async def credential_keeper_stop(token: str = Depends(verify_admin_token)):
+    """停止后台循环并关闭浏览器(磁盘上的 profile 与登录态保留)。"""
+    keeper = _credential_keeper()
+    await keeper.stop()
+    return {"success": True, "message": "已停止并关闭浏览器", "status": keeper.status()}
+
+
+@router.post("/api/credential-keeper/refresh")
+async def credential_keeper_refresh(
+    request: CredentialKeeperRefreshRequest = CredentialKeeperRefreshRequest(),
+    token: str = Depends(verify_admin_token),
+):
+    """立即做一次提取:导航 → 判定登录态 → 读 ST/账号 Cookie → 写库 → 刷 AT。"""
+    from ..core.logger import debug_logger
+
+    keeper = _credential_keeper()
+    result = await keeper.refresh_now(
+        request.token_id, reason="admin-manual", write_db=request.write_db
+    )
+    debug_logger.log_info(f"[API] 凭证浏览器手动提取: {result}")
+    return {"success": bool(result.get("success")), "result": result, "status": keeper.status()}
+
+
+@router.post("/api/credential-keeper/login-window")
+async def credential_keeper_login_window(
+    request: CredentialKeeperLoginWindowRequest = CredentialKeeperLoginWindowRequest(),
+    token: str = Depends(verify_admin_token),
+):
+    """打开(并保持)登录窗口,随后用截图/输入转发完成一次性 Google 登录。"""
+    _require_remote_control()
+    keeper = _credential_keeper()
+    status = await keeper.open_login_window(request.url)
+    return {"success": True, "message": "登录窗口已打开", "status": status}
+
+
+@router.post("/api/credential-keeper/login-window/close")
+async def credential_keeper_login_window_close(token: str = Depends(verify_admin_token)):
+    """关闭登录窗口(profile 保留,登录态不丢)。"""
+    keeper = _credential_keeper()
+    status = await keeper.stop_login_window()
+    return {"success": True, "message": "登录窗口已关闭", "status": status}
+
+
+@router.get("/api/credential-keeper/screenshot")
+async def credential_keeper_screenshot(
+    quality: int = 55,
+    token: str = Depends(verify_admin_token),
+):
+    """返回浏览器当前画面(JPEG),用于在管理台里直接看登录页。"""
+    _require_remote_control()
+    keeper = _credential_keeper()
+    try:
+        image = await keeper.screenshot(quality=quality)
+    except BrowserNotOpen:
+        # 交给全局处理器返回 409,让前端能区分“浏览器没开”与真正的截图失败
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"截图失败: {type(exc).__name__}: {str(exc)[:200]}")
+    return Response(
+        content=image,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+@router.post("/api/credential-keeper/click")
+async def credential_keeper_click(
+    request: CredentialKeeperClickRequest,
+    token: str = Depends(verify_admin_token),
+):
+    _require_remote_control()
+    keeper = _credential_keeper()
+    # probe 回传页内命中的元素/可见性,管理台直接显示,免得“点了没反应”无处查
+    probe = await keeper.click(request.x, request.y, double=request.double)
+    await asyncio.sleep(0.4)
+    return {"success": True, "probe": probe, "status": keeper.status()}
+
+
+@router.get("/api/credential-keeper/pages")
+async def credential_keeper_pages(token: str = Depends(verify_admin_token)):
+    """当前浏览器里的页签/弹窗列表(登录流程常常会另开一个窗口)。"""
+    keeper = _credential_keeper()
+    return {"success": True, "pages": keeper.list_pages(), "status": keeper.status()}
+
+
+@router.post("/api/credential-keeper/select-page")
+async def credential_keeper_select_page(
+    request: CredentialKeeperSelectPageRequest,
+    token: str = Depends(verify_admin_token),
+):
+    """把截图/点击/输入的目标切到指定页签或弹窗上。"""
+    _require_remote_control()
+    keeper = _credential_keeper()
+    try:
+        page = await keeper.select_page(request.index)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    await asyncio.sleep(0.2)
+    return {"success": True, "page": page, "status": keeper.status()}
+
+
+@router.post("/api/credential-keeper/type")
+async def credential_keeper_type(
+    request: CredentialKeeperTypeRequest,
+    token: str = Depends(verify_admin_token),
+):
+    _require_remote_control()
+    keeper = _credential_keeper()
+    await keeper.type_text(request.text, enter=request.enter)
+    await asyncio.sleep(0.3)
+    return {"success": True, "status": keeper.status()}
+
+
+@router.post("/api/credential-keeper/key")
+async def credential_keeper_key(
+    request: CredentialKeeperKeyRequest,
+    token: str = Depends(verify_admin_token),
+):
+    _require_remote_control()
+    keeper = _credential_keeper()
+    # 回传按键前后焦点,方便确认 Tab/Enter 到底有没有作用到页面上
+    probe = await keeper.press(request.key)
+    await asyncio.sleep(0.3)
+    return {"success": True, "probe": probe, "status": keeper.status()}
+
+
+@router.post("/api/credential-keeper/scroll")
+async def credential_keeper_scroll(
+    request: CredentialKeeperScrollRequest,
+    token: str = Depends(verify_admin_token),
+):
+    _require_remote_control()
+    keeper = _credential_keeper()
+    await keeper.scroll(request.dy)
+    return {"success": True, "status": keeper.status()}
+
+
+@router.post("/api/credential-keeper/goto")
+async def credential_keeper_goto(
+    request: CredentialKeeperGotoRequest,
+    token: str = Depends(verify_admin_token),
+):
+    _require_remote_control()
+    keeper = _credential_keeper()
+    try:
+        result = await keeper.navigate(request.url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"跳转失败: {type(exc).__name__}: {str(exc)[:200]}")
+    return {"success": True, "result": result, "status": keeper.status()}
+
+
+@router.post("/api/credential-keeper/reset-profile")
+async def credential_keeper_reset_profile(token: str = Depends(verify_admin_token)):
+    """重置浏览器 profile(旧目录改名备份,不会直接删除),用于登录态彻底损坏时重来。"""
+    keeper = _credential_keeper()
+    result = await keeper.reset_profile()
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result.get("error") or "重置失败")
+    return {"success": True, "result": result, "status": keeper.status()}
 
 
 @router.post("/api/tokens/st2at")
@@ -2352,21 +2667,16 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     if not session_token:
         raise HTTPException(status_code=400, detail="Missing session_token")
 
-    # Step 1: 用统一的自愈入口换取可用会话
-    # ST 本身失效（ACCESS_TOKEN_REFRESH_NEEDED / 401）但插件带了 Google cookie 时，
-    # resolve_session 会直接重新登录换一份新 ST，插件同步因此不再必须手工重登浏览器。
+    # Step 1: Convert ST to AT to get user info (including email)
     try:
-        result = await token_manager.resolve_session(
-            session_token,
-            google_cookies=request.get("google_cookies"),
-            proxy_url=request.get("proxy_url"),
-            email=request.get("login_account"),
-        )
-        session_token = result["st"]          # 可能已被协议登录换成新的
+        result = await token_manager.flow_client.st_to_at(session_token)
         at = result["access_token"]
         expires = result.get("expires")
         user_info = result.get("user", {})
         email = user_info.get("email", "")
+
+        if not email:
+            raise HTTPException(status_code=400, detail="Failed to get email from session token")
 
         # Parse expiration time
         from datetime import datetime
@@ -2380,8 +2690,29 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid session token: {str(e)}")
 
-    if not email:
-        raise HTTPException(status_code=400, detail="Failed to get email from session token")
+    # Step 1.5: 会话里的 Access Token 必须真的可用，否则不能写入并自动启用。
+    # 背景：Flow 迁移到 flow.google.com 后，浏览器里残留的 labs.google 旧会话 cookie
+    # 仍能通过 /auth/session 返回用户信息，但其中的 AT 早已过期
+    # (响应会带 error=ACCESS_TOKEN_REFRESH_NEEDED)，直接入库就会出现
+    # “插件提示 Token 已更新到上游、后台却仍显示已过期”的假成功。
+    session_error = str(result.get("error") or "").strip()
+    at_expired = bool(
+        at_expires and at_expires <= datetime.now(timezone.utc) - timedelta(minutes=5)
+    )
+    if session_error or at_expired:
+        detail = session_error or "access_token expired"
+        from ..core.logger import debug_logger
+
+        debug_logger.log_warning(
+            f"[PLUGIN] 拒绝更新 Token {email}: 会话凭证无效({detail})"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"会话中的 Access Token 已失效({detail})，"
+                "请在浏览器里重新登录 Google(走 labs.google 的登录页)后重新提取 Session Token"
+            ),
+        )
 
     # Step 2: Check if token with this email exists
     existing_token = await db.get_token_by_email(email)
@@ -2403,6 +2734,9 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 auto_refresh_enabled=request.get("auto_refresh_enabled"),
                 refresh_interval_minutes=request.get("refresh_interval_minutes"),
             )
+
+            # 🆕 插件推送后立即重新体检 Google Cookies(账号 Cookies 可能刚被更新)
+            google_cookie_health.schedule(existing_token, force=True, reason="plugin-update")
 
             # Check if auto-enable is enabled and token is disabled
             if plugin_config.auto_enable_on_update and not existing_token.is_active:
@@ -2427,8 +2761,7 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
             new_token = await token_manager.add_token(
                 st=session_token,
                 remark="Added by Chrome Extension",
-                # 不强行给 "session" 默认值：带 Google cookie 时由 add_token 自动启用协议刷新
-                protocol_mode=request.get("protocol_mode"),
+                protocol_mode=request.get("protocol_mode", "session"),
                 google_cookies=request.get("google_cookies"),
                 login_account=request.get("login_account"),
                 login_password=request.get("login_password"),
@@ -2436,6 +2769,9 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 auto_refresh_enabled=request.get("auto_refresh_enabled", True),
                 refresh_interval_minutes=request.get("refresh_interval_minutes", 120),
             )
+
+            # 🆕 新Token入库后立即体检 Google Cookies
+            google_cookie_health.schedule(new_token, force=True, reason="plugin-add")
 
             return {
                 "success": True,
@@ -2491,6 +2827,7 @@ async def plugin_check_tokens(request: Optional[dict] = None, authorization: Opt
             ),
             "last_st_refresh_result": row.get("last_st_refresh_result") or "",
             "credits": row.get("credits", 0),
+            **_google_cookie_health_fields(row),  # 🆕 失效的 google_cookies 明确暴露给插件侧
         })
 
     return {"success": True, "tokens": tokens}

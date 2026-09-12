@@ -71,3 +71,34 @@ remote_browser_api_key = ""   # 远程有头打码服务 API Key
 remote_browser_timeout = 60   # 远程有头打码请求超时(秒)
 capsolver_api_key = ""
 capsolver_base_url = "https://api.capsolver.com"
+
+# Google Cookies(账号态)健康巡检:主动识别失效的 google_cookies,避免它继续误导排查方向
+# (失效后会出现“插件更新成功但后台仍显示过期 / 协议刷新只报 Google 拒绝登录 / 上游 401、403”)
+google_cookie_health_check_enabled = true  # 是否启用巡检
+# google_cookie_health_probe_url = "https://myaccount.google.com/"  # 探针地址,需登录才能访问
+# google_cookie_health_check_ttl_seconds = 600  # 结论缓存时长(秒)
+# google_cookie_health_check_timeout_seconds = 12  # 单次探测超时(秒)
+# google_cookie_health_sweep_interval_seconds = 300  # 后台巡检间隔(秒)
+
+# 服务器自持凭证浏览器(credential keeper)
+#
+# 让服务器用自己的持久 profile 浏览器维持登录态,并定期从浏览器里提取
+# ST 与 .google.com 账号 Cookie 写回数据库,从而不再依赖本地浏览器插件持续推送。
+# 首次登录在服务器上完成:管理台“凭证浏览器”面板里拉取实时截图,
+# 直接点击/输入即可(无需安装 VNC)。
+[credential_keeper]
+enabled = false  # 是否启用
+interval_seconds = 1800  # 后台自持刷新间隔(秒),最小 120
+startup_delay_seconds = 30  # 启动后延迟多久做第一次刷新(秒)
+headless = false  # 是否无头运行;要能在管理台完成登录就保持 false(配合 DISPLAY/Xvfb)
+# profile_dir = "/app/browser_profile_keeper"  # 持久 profile 目录,建议指向 bind-mount 以便容器重建后保留登录态
+# target_url = "https://labs.google/fx/tools/flow"  # 判定登录态并读取 cookie 的页面
+auto_write = true  # 提取到凭证后是否自动写库
+# token_id = 0  # 写回的目标 Token ID;0 表示自动选择第一个启用中的 Token
+remote_control_enabled = true  # 是否启用管理台的截图/输入转发
+skip_when_captcha_busy = true  # 打码任务进行中时跳过本轮,避免小内存机器上两个 Chromium 抢资源
+min_free_mb = 150  # 可用内存低于该值(MB)时跳过本轮；0 表示不限制
+hydrate_from_db = true  # 启动时把库里的 ST/账号 Cookie 注入 profile（profile 与库互为容错）
+push_cookies_to_protocol = true  # 提取到账号 Cookie 后立即回灌给 protocol_mode 的协议刷新并马上跑一次
+needs_login_retry_seconds = 300  # 未登录时的重试间隔(秒)
+# nav_timeout_seconds = 45  # 单次导航超时(秒)

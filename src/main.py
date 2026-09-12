@@ -198,6 +198,21 @@ async def lifespan(app: FastAPI):
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
     token_manager.start_protocol_refresher()
 
+    # 启动 Google Cookies(账号态)健康巡检:只为了把失效的 google_cookies 明确识别出来,
+    # 避免它继续以“插件更新成功却仍显示过期 / 协议刷新只报 Google 拒绝登录 / 上游 401、403”
+    # 的形式误导排查方向。
+    from .services.credential_health import google_cookie_health
+
+    google_cookie_health.configure(db)
+    google_cookie_health.start()
+
+    # 启动服务器自持凭证浏览器:让服务器用自己的持久 profile 维持登录态并定期
+    # 提取 ST/.google.com Cookie 写库,从而不再依赖本地浏览器插件持续推送。
+    from .services.credential_keeper import credential_keeper
+
+    credential_keeper.configure(db, token_manager)
+    credential_keeper.start(token_manager)
+
     print("Database initialized")
     print(f"Total tokens: {len(tokens)}")
     print(f"Cache: {'Enabled' if config.cache_enabled else 'Disabled'} (timeout: {config.cache_timeout}s)")
@@ -207,6 +222,23 @@ async def lifespan(app: FastAPI):
         print("File cache cleanup task disabled (timeout <= 0)")
     print("429 auto-unban task started (runs every hour)")
     print("Protocol token refresher started (runs every minute)")
+    if google_cookie_health.enabled:
+        print(
+            "Google cookies health checker started "
+            f"(sweep every {config.google_cookie_health_sweep_interval_seconds}s, "
+            f"ttl {config.google_cookie_health_check_ttl_seconds}s)"
+        )
+    else:
+        print("Google cookies health checker disabled")
+    if credential_keeper.enabled:
+        print(
+            "Credential keeper started (server-side login state) "
+            f"(every {config.credential_keeper_interval_seconds}s, "
+            f"headless={config.credential_keeper_headless}, "
+            f"profile={credential_keeper._profile_dir()})"
+        )
+    else:
+        print("Credential keeper disabled (set credential_keeper.enabled = true to enable)")
     print(f"Server running on http://{config.server_host}:{config.server_port}")
     print("=" * 60)
 
@@ -223,6 +255,8 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     await token_manager.stop_protocol_refresher()
+    await google_cookie_health.stop()
+    await credential_keeper.stop()
     # Close browser if initialized
     if browser_service:
         await browser_service.close()
@@ -230,6 +264,7 @@ async def lifespan(app: FastAPI):
     print("File cache cleanup task stopped")
     print("429 auto-unban task stopped")
     print("Protocol token refresher stopped")
+    print("Google cookies health checker stopped")
 
 
 # Initialize components
@@ -259,6 +294,17 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# 凭证浏览器未打开时给管理台一个明确的 409,而不是 500
+from .services.credential_keeper import BrowserNotOpen  # noqa: E402
+
+
+@app.exception_handler(BrowserNotOpen)
+async def _credential_keeper_browser_not_open(request: Request, exc: BrowserNotOpen):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
 
 # CORS middleware
 app.add_middleware(
