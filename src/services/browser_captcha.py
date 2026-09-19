@@ -252,6 +252,17 @@ BROWSER_SESSION_COOKIE_TARGET_URLS = (
     "https://www.recaptcha.net/",
 )
 
+# 2026-09-18:Google 在 labs.google / flow.google.com 弹出 cookie 同意页(页面特征:
+# 正文以 "uses cookies to deliver and enhance the quality of its services" 开头),
+# 该页面没有 grecaptcha,导致打码无限等待。SOCS 是 Google 同意状态 cookie,
+# 预写后可显著降低同意页出现概率;即使仍出现,也会通过页面交互自动点击 Accept all。
+GOOGLE_CONSENT_SOCS_COOKIE = "CAESEwgDEgk2NzM5OTg2MDUaAmVuIAEaBgiA_LyaBg"
+GOOGLE_CONSENT_COOKIE_TARGETS = (
+    "https://labs.google/",
+    "https://www.google.com/",
+    "https://flow.google.com/",
+)
+
 # 浏览器内提交的可用性缓存:
 # 迁移到 flow.google.com 后,应用页只对登录态开放,匿名访问会被路由到营销页 /about
 # (无 grecaptcha),而且新域名 CSP 会拦截补注入脚本,此时浏览器内提交必然失败。
@@ -1214,6 +1225,14 @@ class TokenBrowser:
 
         try:
             await context.clear_cookies()
+            # 2026-09-18:预写 Google 同意状态 cookie(SOCS),避免 labs.google /
+            # flow.google.com 弹出 cookie 同意页导致打码页无 grecaptcha。
+            try:
+                browser_cookies.extend(self._build_consent_cookie_targets())
+            except Exception as consent_error:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] Token-{self.token_id} 预写 SOCS 同意 cookie 失败: {consent_error}"
+                )
             await context.add_cookies(browser_cookies)
             self._shared_bound_token_id = token_key
             self._shared_bound_cookie_signature = cookie_signature
@@ -1231,6 +1250,105 @@ class TokenBrowser:
             self._shared_bound_token_id = token_key
             self._shared_bound_cookie_signature = None
             return True
+
+    @classmethod
+    def _build_consent_cookie_targets(cls) -> List[Dict[str, Any]]:
+        """构造 Google 同意状态(SOCS)cookie,预写到各 Google 域,避免出现同意页。"""
+        targets: List[Dict[str, Any]] = []
+        for target_url in GOOGLE_CONSENT_COOKIE_TARGETS:
+            targets.append({
+                "name": "SOCS",
+                "value": GOOGLE_CONSENT_SOCS_COOKIE,
+                "url": target_url,
+                "secure": True,
+                "httpOnly": False,
+                "sameSite": "Lax",
+            })
+        return targets
+
+    async def _maybe_accept_google_consent(self, page, *, context_label: str = "") -> bool:
+        """检测并处理 Google cookie 同意页。
+
+        同意页特征:正文以 "uses cookies to deliver ..." 开头(SOCS 缺失时出现),
+        页面上没有 grecaptcha。处理方式:优先点击 Accept all 按钮(多语言),
+        兼容按钮不可见时直接提交 consent 表单;成功后等页面跳转完成。
+
+        Returns:
+            True 表示检测到同意页并成功处理;False 表示未检测到(或处理失败,
+            由调用方按原有超时逻辑继续,不阻塞主流程)。
+        """
+        label = f"{context_label} " if context_label else ""
+        try:
+            # 页面主线程可能永久卡死(当日故障实观测 evaluate 52s+ 不返回),
+            # 所有页面交互必须带超时,否则会重现“请求永久挂起”故障。
+            probe = await asyncio.wait_for(
+                page.evaluate(
+                """
+                () => {
+                    try {
+                        const text = (document.body ? document.body.innerText.slice(0, 400) : "");
+                        const isConsent = text.includes("uses cookies to deliver")
+                            || text.includes("verwendet Cookies")
+                            || text.includes("utilise des cookies");
+                        return { isConsent, url: location.href.slice(0, 160) };
+                    } catch (e) { return { isConsent: false, url: "" };
+                }
+                """
+                ),
+                timeout=10,
+            )
+        except Exception:
+            return False
+        if not isinstance(probe, dict) or not probe.get("isConsent"):
+            return False
+
+        debug_logger.log_warning(
+            f"[BrowserCaptcha] Token-{self.token_id} {label}检测到 Google cookie 同意页 "
+            f"({(probe.get('url') or '')[:160]})，尝试自动点击 Accept all"
+        )
+        try:
+            accepted = await asyncio.wait_for(
+                page.evaluate(
+                """
+                () => {
+                    const labelRe = /(Accept all|Alle akzeptieren|Tout accepter|Aceptar todas|Accettare tutto|I agree)/i;
+                    const nodes = Array.from(document.querySelectorAll('button, [role=button], form button, a'));
+                    const btn = nodes.find((el) => {
+                        const t = (el.innerText || el.textContent || "").trim();
+                        if (t && labelRe.test(t)) return true;
+                        const aria = (el.getAttribute && (el.getAttribute("aria-label") || "")) || "";
+                        return !!(aria && labelRe.test(aria));
+                    });
+                    if (btn) { btn.click(); return { clicked: true, via: "button" }; }
+                    const form = document.querySelector("form[action*='consent'], form[action*='Consent']");
+                    if (form) { form.submit(); return { clicked: true, via: "form" }; }
+                    return { clicked: false };
+                }
+                """
+                ),
+                timeout=15,
+            )
+        except Exception as click_error:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}同意页点击失败: "
+                f"{type(click_error).__name__}: {str(click_error)[:150]}"
+            )
+            return False
+        if not isinstance(accepted, dict) or not accepted.get("clicked"):
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}同意页未找到可点击的 Accept 控件"
+            )
+            return False
+
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        debug_logger.log_info(
+            f"[BrowserCaptcha] Token-{self.token_id} {label}同意页已接受 (via={accepted.get('via')})，"
+            f"当前 url={page.url[:160]}"
+        )
+        return True
 
     async def _prepare_flow_runtime_page(
         self,
@@ -1259,7 +1377,12 @@ class TokenBrowser:
                 debug_logger.log_info(
                     f"[BrowserCaptcha] Token-{self.token_id} {label}打开真实 Flow 页面: {target_url} (action={action})"
                 )
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+                # 2026-09-18:goto 也包一层硬超时。当日故障中 goto 已返回但页面主线程
+                # 卡死,后续 evaluate 全部悬挂;若 goto 自身悬挂也能在此熔断。
+                await asyncio.wait_for(
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=45000),
+                    timeout=50,
+                )
                 loaded = True
                 break
             except Exception as e:
@@ -1273,6 +1396,14 @@ class TokenBrowser:
                 f"[BrowserCaptcha] Token-{self.token_id} {label}无法打开真实 Flow 页面: {last_error or 'unknown'}"
             )
             return False
+
+        # 2026-09-18:labs.google/flow.google.com 可能弹出 cookie 同意页(无 grecaptcha),
+        # 需先自动接受再进入预热/等待流程,否则后续 grecaptcha 等待必然超时。
+        if await self._maybe_accept_google_consent(page, context_label=f"{label}真实页面"):
+            try:
+                await page.goto(page.url, wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
 
         # 2026-09-11:flow.google.com 认的是 .google.com 账号 cookies。库内账号态失效时,
         # 真实应用页会被重定向到 accounts.google.com 登录页,而登录页永远没有 grecaptcha。
@@ -1291,9 +1422,13 @@ class TokenBrowser:
             ready = False
         else:
             page_loaded = False
+            # 2026-09-18:evaluate 也可能因页面主线程卡死而永久悬挂(当日故障根因之一),
+            # 每次探测都包 wait_for,最坏情况下 20 轮共 30s 后进入 grecaptcha 等待逻辑。
             for _ in range(20):
                 try:
-                    ready_state = await page.evaluate("document.readyState")
+                    ready_state = await asyncio.wait_for(
+                        page.evaluate("document.readyState"), timeout=2
+                    )
                     if ready_state == "complete":
                         page_loaded = True
                         break
@@ -1306,15 +1441,16 @@ class TokenBrowser:
                 )
 
             try:
-                await page.bring_to_front()
+                await asyncio.wait_for(page.bring_to_front(), timeout=5)
             except Exception:
                 pass
 
             try:
-                await page.mouse.move(320, 220)
-                await page.mouse.move(560, 360, steps=16)
-                await page.mouse.wheel(0, 260)
-                await page.evaluate(
+                await asyncio.wait_for(page.mouse.move(320, 220), timeout=5)
+                await asyncio.wait_for(page.mouse.move(560, 360, steps=16), timeout=5)
+                await asyncio.wait_for(page.mouse.wheel(0, 260), timeout=5)
+                await asyncio.wait_for(
+                    page.evaluate(
                     """
                     (() => {
                         try {
@@ -1329,6 +1465,8 @@ class TokenBrowser:
                         } catch (e) {}
                     })()
                     """
+                    ),
+                    timeout=10,
                 )
             except Exception:
                 pass
@@ -1358,8 +1496,13 @@ class TokenBrowser:
                         f"[BrowserCaptcha] Token-{self.token_id} {label}应用页无法提供 grecaptcha"
                         f"(无登录态被重定向到登录页 / 匿名 /about 且 CSP 拦截脚本注入),回退中性页面: {bootstrap_url}"
                     )
-                    await page.goto(bootstrap_url, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.wait_for(
+                        page.goto(bootstrap_url, wait_until="domcontentloaded", timeout=45000),
+                        timeout=50,
+                    )
                     await asyncio.sleep(1.5)
+                    # 中性页同样可能落在同意页(labs.google 无 SOCS 时),先处理再等待。
+                    await self._maybe_accept_google_consent(page, context_label=f"{label}中性页")
                     ready = await self._wait_for_enterprise_ready(
                         page,
                         website_key,
@@ -1485,6 +1628,41 @@ class TokenBrowser:
                 debug_logger.log_info(
                     f"[BrowserCaptcha] Token-{self.token_id} using custom browser executable: {browser_executable_path}"
                 )
+
+            keeper_profile_dir = ""
+            if bool(getattr(config, "browser_use_keeper_profile", False)):
+                keeper_profile_dir = str(getattr(config, "credential_keeper_profile_dir", "") or "").strip()
+
+            if keeper_profile_dir and os.path.isdir(keeper_profile_dir):
+                # 2026-09-18c:打码浏览器直接复用 keeper 的持久 profile(单 jar),
+                # 避免“临时 context + 注入快照”与 Google 侧登录态/同意态不一致。
+                try:
+                    from .credential_keeper import credential_keeper as _keeper
+                    await _keeper.close()
+                except Exception as _ce:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] Token-{self.token_id} 复用 keeper profile 前关闭凭证浏览器失败: {_ce}"
+                    )
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=keeper_profile_dir,
+                    headless=headless,
+                    executable_path=browser_executable_path,
+                    proxy=proxy_option,
+                    args=browser_args,
+                    viewport=viewport,
+                    locale="en-US",
+                )
+                browser = context.browser or context
+                await self._apply_browser_environment_patch(context, label="persistent-context")
+                if manage_slot_pid:
+                    try:
+                        self._write_pid_file(self._extract_browser_pid(browser))
+                    except Exception:
+                        pass
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] Token-{self.token_id} 打码浏览器复用 keeper 持久 profile: {keeper_profile_dir}"
+                )
+                return playwright, browser, context
 
             browser = await playwright.chromium.launch(
                 headless=headless,
@@ -1665,7 +1843,9 @@ class TokenBrowser:
     async def _capture_page_fingerprint(self, page):
         """从浏览器页面提取 UA 与客户端提示头，确保与打码浏览器一致。"""
         try:
-            fingerprint = await page.evaluate("""
+            # 2026-09-18:页面主线程卡死时 evaluate 会永久悬挂,加 15s 超时防护。
+            fingerprint = await asyncio.wait_for(
+                page.evaluate("""
                 () => {
                     const ua = navigator.userAgent || "";
                     const lang = navigator.language || "";
@@ -1694,7 +1874,9 @@ class TokenBrowser:
                         sec_ch_ua_platform: secChUaPlatform,
                     };
                 }
-            """)
+            """),
+                timeout=15,
+            )
 
             if not isinstance(fingerprint, dict):
                 return
@@ -1725,7 +1907,8 @@ class TokenBrowser:
 
         while (time.time() - started_at) < timeout_seconds:
             try:
-                result = await page.evaluate(
+                result = await asyncio.wait_for(
+                    page.evaluate(
                     """
                         () => {
                             const bodyText = ((document.body && document.body.innerText) || "")
@@ -1761,6 +1944,8 @@ class TokenBrowser:
                             };
                         }
                     """
+                    ),
+                    timeout=10,
                 )
             except Exception as e:
                 result = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
@@ -1789,7 +1974,8 @@ class TokenBrowser:
             if not refresh_clicked and (time.time() - started_at) >= 2:
                 refresh_clicked = True
                 try:
-                    await page.evaluate(
+                    await asyncio.wait_for(
+                        page.evaluate(
                         """
                             () => {
                                 const nodes = Array.from(
@@ -1806,6 +1992,8 @@ class TokenBrowser:
                                 return false;
                             }
                         """
+                        ),
+                        timeout=8,
                     )
                 except Exception:
                     pass
@@ -2276,6 +2464,71 @@ class TokenBrowser:
     def has_shared_browser(self) -> bool:
         return bool(self._shared_browser or self._shared_context or self._shared_keepalive_page)
 
+    async def describe_runtime(self) -> Dict[str, Any]:
+        """资源管理器快照:当前槽位的浏览器/页面/打码状态(供管理台展示)。
+
+        所有取值都做了异常保护,页面悬挂时也能返回可用信息(置 unknown/None),
+        不会因为读状态而把 API 请求挂住。
+        """
+        pages: List[Dict[str, Any]] = []
+        context = self._shared_context
+        if context is not None:
+            try:
+                context_pages = list(context.pages)
+            except Exception:
+                context_pages = []
+            for index, page in enumerate(context_pages):
+                try:
+                    if page.is_closed():
+                        continue
+                except Exception:
+                    continue
+                url = ""
+                try:
+                    url = await asyncio.wait_for(page.evaluate("() => location.href"), timeout=2)
+                except asyncio.TimeoutError:
+                    url = "<页面无响应>"
+                except Exception:
+                    try:
+                        url = str(page.url or "")
+                    except Exception:
+                        url = ""
+                entry: Dict[str, Any] = {
+                    "index": index,
+                    "url": str(url or "")[:300],
+                    "responsive": url != "<页面无响应>",
+                    "is_keepalive": page is self._shared_keepalive_page,
+                }
+                if entry["responsive"] and entry["url"]:
+                    # 无响应页面拿不到 readyState;顺带取一次用于展示(超时也不阻塞)
+                    try:
+                        entry["ready_state"] = await asyncio.wait_for(
+                            page.evaluate("() => document.readyState"), timeout=2
+                        )
+                    except Exception:
+                        pass
+                pages.append(entry)
+        busy_seconds = self.busy_seconds()
+        pid = self._shared_browser_pid
+        if not pid:
+            pid = self._read_pid_file()
+        return {
+            "slot_id": self.token_id,
+            "has_browser": self.has_shared_browser(),
+            "browser_connected": self._shared_browser.is_connected() if self._shared_browser else False,
+            "busy": self.is_busy(),
+            "busy_seconds": round(busy_seconds, 1) if busy_seconds is not None else None,
+            "idle_seconds": round(self.idle_seconds(), 1),
+            "launch_count": self._shared_launch_count,
+            "reuse_count": self._shared_reuse_count,
+            "solve_count": self._solve_count,
+            "error_count": self._error_count,
+            "bound_token_id": self._shared_bound_token_id,
+            "proxy": self._shared_proxy_url or None,
+            "pid": pid,
+            "pages": pages,
+        }
+
     def get_last_fingerprint(self) -> Optional[Dict[str, Any]]:
         """返回最近一次打码浏览器的指纹快照。"""
         if not self._last_fingerprint:
@@ -2304,13 +2557,31 @@ class TokenBrowser:
                 f"{type(e).__name__}: {str(e)[:200]}"
             )
             try:
-                _diag = await page.evaluate("() => ({url: location.href.slice(0,140), title: document.title.slice(0,60), grec: typeof grecaptcha, ent: (typeof grecaptcha !== 'undefined' ? typeof grecaptcha.enterprise : 'n/a'), rs: document.readyState, tt: (typeof trustedTypes !== 'undefined'), recScripts: Array.from(document.scripts).map(x => x.src || '').filter(x => x.includes('recaptcha')).slice(0,3), bodyHead: (document.body ? document.body.innerText.slice(0, 150) : '')})")
+                # 2026-09-18:页面卡死时诊断 evaluate 自身也会永久悬挂(曾观测 52s+),
+                # 必须加超时防护,避免诊断阻塞主流程。
+                _diag = await asyncio.wait_for(
+                    page.evaluate("() => ({url: location.href.slice(0,140), title: document.title.slice(0,60), grec: typeof grecaptcha, ent: (typeof grecaptcha !== 'undefined' ? typeof grecaptcha.enterprise : 'n/a'), rs: document.readyState, tt: (typeof trustedTypes !== 'undefined'), recScripts: Array.from(document.scripts).map(x => x.src || '').filter(x => x.includes('recaptcha')).slice(0,3), bodyHead: (document.body ? document.body.innerText.slice(0, 150) : '')})"),
+                    timeout=10,
+                )
                 debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} {label}页面诊断: {_diag}")
             except Exception as _de:
                 debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} {label}诊断失败: {type(_de).__name__}: {str(_de)[:150]}")
 
+            # 2026-09-18b:Google 同意页(SOCS 缺失)本身不含 grecaptcha,补注入脚本也没用。
+            # 首轮等待失败后先尝试接受同意页,再重试一次等待,避免整轮空等 330s 后熔断。
+            try:
+                if await self._maybe_accept_google_consent(page, context_label=context_label):
+                    await asyncio.wait_for(
+                        page.wait_for_function(wait_expression, timeout=timeout_ms),
+                        timeout=timeout_ms / 1000 + 10,
+                    )
+                    return True
+            except Exception:
+                pass
+
         try:
-            await page.evaluate(
+            await asyncio.wait_for(
+                page.evaluate(
                 """
                 ([primaryUrl, secondaryUrl]) => {
                     const existing = Array.from(document.scripts || []).some((script) => {
@@ -2335,8 +2606,13 @@ class TokenBrowser:
                     f"{primary_host}/recaptcha/enterprise.js?render={website_key}",
                     f"{secondary_host}/recaptcha/enterprise.js?render={website_key}",
                 ],
+                ),
+                timeout=15,
             )
-            await page.wait_for_function(wait_expression, timeout=timeout_ms)
+            await asyncio.wait_for(
+                page.wait_for_function(wait_expression, timeout=timeout_ms),
+                timeout=timeout_ms / 1000 + 10,
+            )
             return True
         except Exception as inject_error:
             debug_logger.log_warning(
@@ -3107,19 +3383,38 @@ class BrowserCaptchaService:
         token: Optional[str] = None
         request_ref: Optional[str] = None
 
+        # 2026-09-18:单次打码硬超时。同意页/页面卡死会让 solve 永久悬挂并占住
+        # 全部槽位(后续请求 503),这里熔断为快速失败,交给上层重试/降级逻辑。
+        solve_hard_timeout = max(30, int(getattr(config, "browser_captcha_solve_timeout", 150) or 150) + 30)
+
         # 全局并发限制（如果已配置）
         if self._token_semaphore:
             async with self._token_semaphore:
                 browser_id = await self._select_browser_id(project_id)
                 try:
                     browser = await self._get_or_create_browser(browser_id)
-                    token, request_ref = await browser.get_token(
-                        project_id,
-                        self.website_key,
-                        action,
-                        token_proxy_url=token_proxy_url,
-                        token_id=token_id,
-                    )
+                    try:
+                        token, request_ref = await asyncio.wait_for(
+                            browser.get_token(
+                                project_id,
+                                self.website_key,
+                                action,
+                                token_proxy_url=token_proxy_url,
+                                token_id=token_id,
+                            ),
+                            timeout=solve_hard_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        debug_logger.log_warning(
+                            f"[BrowserCaptcha] 打码硬超时({solve_hard_timeout}s)，熔断为快速失败 "
+                            f"(browser_id={browser_id}, project_id={project_id}, action={action})"
+                        )
+                        try:
+                            await browser.recycle_browser(reason="solve_hard_timeout", rotate_profile=False)
+                        except Exception as recycle_error:
+                            debug_logger.log_warning(
+                                f"[BrowserCaptcha] 硬超时后回收打码浏览器失败: {recycle_error}"
+                            )
                 finally:
                     await self._release_slot_reservation(browser_id)
 
@@ -3134,13 +3429,28 @@ class BrowserCaptchaService:
         browser_id = await self._select_browser_id(project_id)
         try:
             browser = await self._get_or_create_browser(browser_id)
-            token, request_ref = await browser.get_token(
-                project_id,
-                self.website_key,
-                action,
-                token_proxy_url=token_proxy_url,
-                token_id=token_id,
-            )
+            try:
+                token, request_ref = await asyncio.wait_for(
+                    browser.get_token(
+                        project_id,
+                        self.website_key,
+                        action,
+                        token_proxy_url=token_proxy_url,
+                        token_id=token_id,
+                    ),
+                    timeout=solve_hard_timeout,
+                )
+            except asyncio.TimeoutError:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] 打码硬超时({solve_hard_timeout}s)，熔断为快速失败 "
+                    f"(browser_id={browser_id}, project_id={project_id}, action={action})"
+                )
+                try:
+                    await browser.recycle_browser(reason="solve_hard_timeout", rotate_profile=False)
+                except Exception as recycle_error:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] 硬超时后回收打码浏览器失败: {recycle_error}"
+                    )
         finally:
             await self._release_slot_reservation(browser_id)
 
@@ -3230,6 +3540,101 @@ class BrowserCaptchaService:
             if not browser:
                 return None
             return browser.get_last_fingerprint()
+
+    async def get_runtime_resources(self) -> Dict[str, Any]:
+        """资源管理器快照:列举所有打码 slot/浏览器/页面与打码状态(供管理台展示)。
+
+        页面信息读取都有超时保护,页面悬挂时标记 responsive=False 而不是卡住接口。
+        """
+        async with self._browsers_lock:
+            browsers = list(self._browsers.values())
+        slots: List[Dict[str, Any]] = []
+        for browser in browsers:
+            try:
+                slots.append(await browser.describe_runtime())
+            except Exception as e:
+                slots.append({
+                    "slot_id": getattr(browser, "token_id", None),
+                    "error": f"{type(e).__name__}: {str(e)[:150]}",
+                })
+        slots.sort(key=lambda item: (item.get("slot_id") is None, item.get("slot_id") or 0))
+        busy_count = sum(1 for s in slots if s.get("busy"))
+        browser_count = sum(1 for s in slots if s.get("has_browser"))
+        page_count = sum(len(s.get("pages") or []) for s in slots)
+        unresponsive_pages = sum(
+            1 for s in slots for p in (s.get("pages") or []) if p.get("responsive") is False
+        )
+        return {
+            "method": "browser",
+            "browser_count_config": self._browser_count,
+            "summary": {
+                "slots": len(slots),
+                "browsers": browser_count,
+                "pages": page_count,
+                "busy": busy_count,
+                "unresponsive_pages": unresponsive_pages,
+            },
+            "slots": slots,
+            "timestamp": time.time(),
+        }
+
+    async def close_runtime_resource(
+        self,
+        slot_id: int,
+        page_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """管理台手动关闭打码资源:关单个页签(page_index)或整个浏览器槽位。
+
+        关浏览器时保留 slot 实例(下次打码自动重建),只回收浏览器进程与页面。
+        """
+        async with self._browsers_lock:
+            browser = self._browsers.get(slot_id)
+        if browser is None:
+            raise ValueError(f"槽位 {slot_id} 不存在或尚未创建浏览器")
+
+        if page_index is None:
+            await browser.recycle_browser(reason="admin_manual_close", rotate_profile=False)
+            return {
+                "success": True,
+                "message": f"槽位 {slot_id} 浏览器已关闭(下次打码会自动重建)",
+                "slot_id": slot_id,
+            }
+
+        context = browser._shared_context
+        if context is None:
+            raise ValueError(f"槽位 {slot_id} 当前没有运行中的浏览器")
+        try:
+            pages = [p for p in list(context.pages) if not p.is_closed()]
+        except Exception as e:
+            raise ValueError(f"读取槽位 {slot_id} 页面列表失败: {type(e).__name__}: {str(e)[:120]}")
+        if page_index < 0 or page_index >= len(pages):
+            raise ValueError(f"页面序号越界(可选 0-{max(len(pages) - 1, 0)})")
+        page = pages[page_index]
+        is_keepalive = page is browser._shared_keepalive_page
+        try:
+            await asyncio.wait_for(page.close(), timeout=10)
+        except Exception as e:
+            # 页面可能已死/无响应,close 卡住时直接标记丢弃,让 idle reaper 兑现回收
+            try:
+                await page.close(no_wait_after=True)
+            except Exception:
+                pass
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] 管理台关闭页面超时/失败(slot={slot_id}, page={page_index}): "
+                f"{type(e).__name__}: {str(e)[:150]}"
+            )
+        if is_keepalive:
+            browser._shared_keepalive_page = None
+            try:
+                await browser._ensure_shared_keepalive_page()
+            except Exception:
+                pass
+        return {
+            "success": True,
+            "message": f"槽位 {slot_id} 页面 #{page_index} 已关闭",
+            "slot_id": slot_id,
+            "page_index": page_index,
+        }
 
     async def submit_flow_request(
         self,

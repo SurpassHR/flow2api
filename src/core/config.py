@@ -533,6 +533,16 @@ class Config:
         return bool(self._config.get("captcha", {}).get("browser_bind_login_state", True))
 
     @property
+    def browser_use_keeper_profile(self) -> bool:
+        """打码浏览器是否直接复用凭证浏览器(keeper)的持久 profile。
+
+        默认 False。开启后打码与 keeper 共用同一个 profile(单 jar),登录态与
+        cookie 同意态天然一致,不再依赖“临时 context + 注入快照”。
+        打码前会先关闭 keeper 浏览器以释放 Chromium profile 单例锁。
+        """
+        return bool(self._config.get("captcha", {}).get("use_keeper_profile", False))
+
+    @property
     def browser_captcha_solve_timeout(self) -> int:
         """单次打码硬超时(秒)，超时强制回收浏览器防止悬挂。"""
         value = self._config.get("captcha", {}).get("browser_captcha_solve_timeout", 150)

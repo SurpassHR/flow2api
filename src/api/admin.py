@@ -2216,6 +2216,70 @@ async def get_captcha_runtime_status(
     return status
 
 
+async def _get_browser_captcha_service():
+    """获取 browser 模式打码服务实例(未初始化时返回 None)。"""
+    try:
+        module = importlib.import_module("src.services.browser_captcha")
+        service_cls = getattr(module, "BrowserCaptchaService")
+    except Exception:
+        return None
+    instance = getattr(service_cls, "_instance", None)
+    if instance is None:
+        # 尚未初始化过说明从未用过 browser 打码,无需为查看资源而拉起浏览器环境
+        return None
+    return instance
+
+
+@router.get("/api/captcha/browser-resources")
+async def get_captcha_browser_resources(token: str = Depends(verify_admin_token)):
+    """打码浏览器资源管理器:列举所有 slot/浏览器进程/页面及打码状态。"""
+    service = await _get_browser_captcha_service()
+    if service is None:
+        return {
+            "method": "browser",
+            "available": False,
+            "message": "打码服务尚未初始化(当前未使用 browser 模式打码或尚未触发过打码)",
+            "browser_count_config": None,
+            "summary": {"slots": 0, "browsers": 0, "pages": 0, "busy": 0, "unresponsive_pages": 0},
+            "slots": [],
+        }
+    try:
+        payload = await service.get_runtime_resources()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取打码资源状态失败: {type(exc).__name__}: {str(exc)[:200]}")
+    payload["available"] = True
+    return payload
+
+
+class CaptchaResourceCloseRequest(BaseModel):
+    slot_id: int
+    page_index: Optional[int] = None
+
+
+@router.post("/api/captcha/browser-resources/close")
+async def close_captcha_browser_resource(
+    request: CaptchaResourceCloseRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """手动关闭打码资源:page_index 为空关闭整个浏览器槽位,否则只关指定页签。"""
+    service = await _get_browser_captcha_service()
+    if service is None:
+        raise HTTPException(status_code=409, detail="打码服务尚未初始化,没有可关闭的资源")
+    try:
+        result = await service.close_runtime_resource(request.slot_id, request.page_index)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"关闭失败: {type(exc).__name__}: {str(exc)[:200]}")
+    from ..core.logger import debug_logger
+
+    debug_logger.log_info(
+        f"[API] 管理台手动关闭打码资源: slot={request.slot_id}, "
+        f"page={request.page_index if request.page_index is not None else 'browser'}"
+    )
+    return result
+
+
 @router.get("/api/captcha/config")
 async def get_captcha_config(token: str = Depends(verify_admin_token)):
     """Get captcha configuration"""
@@ -2726,6 +2790,7 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 st=session_token,
                 at=at,
                 at_expires=at_expires,
+                project_id=request.get("project_id"),
                 protocol_mode=request.get("protocol_mode"),
                 google_cookies=request.get("google_cookies"),
                 login_account=request.get("login_account"),

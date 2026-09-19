@@ -47,6 +47,7 @@
                 <button onclick="switchTab('tokens')" id="tabTokens" class="tab-btn border-b-2 border-primary text-sm font-medium py-3 px-1">Token 管理</button>
                 <button onclick="switchTab('settings')" id="tabSettings" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">系统配置</button>
                 <button onclick="switchTab('keeper')" id="tabKeeper" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">凭证浏览器</button>
+                <button onclick="switchTab('captchaResources')" id="tabCaptchaResources" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">打码资源</button>
                 <button onclick="switchTab('logs')" id="tabLogs" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">请求日志</button>
                 <a href="/test" id="tabTestPage" class="tab-btn inline-flex items-center border-b-2 border-transparent text-sm font-medium py-3 px-1">测试页面</a>
             </nav>
@@ -653,6 +654,39 @@
             </div>
         </div>
 
+        <!-- 打码资源面板 -->
+        <div id="panelCaptchaResources" class="hidden">
+            <div class="rounded-lg border border-border bg-background">
+                <div class="flex flex-wrap items-center justify-between gap-4 p-4 border-b border-border">
+                    <div>
+                        <h3 class="text-lg font-semibold">打码浏览器资源管理器</h3>
+                        <p class="text-xs text-muted-foreground mt-1">
+                            监控 browser 模式打码使用的浏览器窗口/页签：哪些正在打码、哪些空闲、哪些长时间无响应。
+                            发现卡死的资源可以在这里手动关闭，不影响 Token 登录态（下次打码自动重建）。
+                        </p>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <label class="inline-flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+                            <input type="checkbox" id="captchaResAutoRefresh" checked class="h-4 w-4 rounded border-input">
+                            自动刷新(3s)
+                        </label>
+                        <button onclick="loadCaptchaResources()" class="inline-flex items-center justify-center rounded-md transition-colors hover:bg-accent h-8 w-8" title="刷新">
+                            <svg class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="p-4">
+                    <div id="captchaResSummary" class="grid gap-3 grid-cols-2 md:grid-cols-5 mb-4"></div>
+                    <div id="captchaResNotice" class="hidden rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 mb-4"></div>
+                    <div id="captchaResList" class="space-y-4">
+                        <div class="py-8 px-3 text-center text-sm text-muted-foreground">加载中...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- 请求日志面板 -->
         <div id="panelLogs" class="hidden">
             <div class="rounded-lg border border-border bg-background">
@@ -1114,7 +1148,15 @@
         resumeCaptchaRuntimeStatusPollingIfNeeded=async(method)=>{if(method!=='browser'&&method!=='personal')return;const status=await pollCaptchaRuntimeStatus(method,{silent:true});if(status&&(status.active||status.task_running||status.state==='running'))startCaptchaRuntimeStatusPolling(method)},
         showToast=(m,t='info',duration=2000)=>{const d=document.createElement('div'),bc={success:'bg-green-600',error:'bg-destructive',info:'bg-primary'};d.className=`fixed bottom-4 right-4 ${bc[t]||bc.info} text-white px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium z-50 animate-slide-up`;d.textContent=m;document.body.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .3s';setTimeout(()=>d.parentNode&&document.body.removeChild(d),300)},duration)},
         logout=async()=>{if(!confirm('确定要退出登录吗?'))return;try{await fetch('/api/admin/logout',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'}})}catch(e){console.error('服务端退出登录失败:',e)}finally{location.href='/login'}},
-        switchTab=t=>{const cap=n=>n.charAt(0).toUpperCase()+n.slice(1);['tokens','settings','logs','keeper'].forEach(n=>{const active=n===t;$(`panel${cap(n)}`).classList.toggle('hidden',!active);$(`tab${cap(n)}`).classList.toggle('border-primary',active);$(`tab${cap(n)}`).classList.toggle('text-primary',active);$(`tab${cap(n)}`).classList.toggle('border-transparent',!active);$(`tab${cap(n)}`).classList.toggle('text-muted-foreground',!active)});if(t!=='keeper')keeperStopPolling();if(t==='settings'){stopLogsAutoRefresh();loadAdminConfig();loadProxyConfig();loadCacheConfig();loadGenerationTimeout();loadCallLogicConfig();loadCaptchaConfig();loadPluginConfig();loadATAutoRefreshConfig()}else if(t==='logs'){startLogsAutoRefresh();loadLogs()}else if(t==='keeper'){stopLogsAutoRefresh();keeperStartPolling()}else{stopLogsAutoRefresh()}};
+        stopCaptchaResAutoRefresh=()=>{if(window.captchaResTimer){clearInterval(window.captchaResTimer);window.captchaResTimer=null}},
+        startCaptchaResAutoRefresh=()=>{stopCaptchaResAutoRefresh();window.captchaResTimer=setInterval(()=>{if($('captchaResAutoRefresh')&&!$('captchaResAutoRefresh').checked)return;loadCaptchaResources({silent:true})},3000)},
+        formatCaptchaResDuration=s=>{if(s==null)return'-';const v=Number(s)||0;if(v<60)return`${v.toFixed(0)}秒`;if(v<3600)return`${Math.floor(v/60)}分${Math.floor(v%60)}秒`;return`${Math.floor(v/3600)}小时${Math.floor(v%3600/60)}分`},
+        renderCaptchaResSummary=s=>{const box=$('captchaResSummary');if(!box)return;const items=[['槽位',s.slots,'text-muted-foreground'],['运行中的浏览器',s.browsers,'text-blue-600'],['打开页签数',s.pages,'text-muted-foreground'],['打码进行中',s.busy,s.busy?'text-orange-600':'text-muted-foreground'],['无响应页签',s.unresponsive_pages,s.unresponsive_pages?'text-red-600':'text-muted-foreground']];box.innerHTML=items.map(([k,v,cls])=>`<div class="rounded-lg border border-border bg-background p-3"><p class="text-xs font-medium text-muted-foreground mb-1">${k}</p><h3 class="text-lg font-bold ${cls}">${v}</h3></div>`).join('')},
+        renderCaptchaResPage=(slotId,p)=>{const responsive=p.responsive!==false;const stateBadge=!responsive?'<span class="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] bg-red-50 text-red-700 font-medium">无响应</span>':(p.ready_state&&p.ready_state!=='complete'?'<span class="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] bg-amber-50 text-amber-700">加载中</span>':'');const urlText=String(p.url||'about:blank');return`<div class="flex items-center justify-between gap-2 rounded border border-border px-2 py-1.5 ${responsive?'':'border-red-300 bg-red-50/40'}"><div class="min-w-0 flex items-center gap-2"><span class="text-[11px] text-muted-foreground shrink-0">#${p.index}</span>${p.is_keepalive?'<span class="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] bg-gray-100 text-gray-600 shrink-0">保活</span>':''}${stateBadge}<span class="text-xs truncate ${responsive?'text-foreground':'text-red-700 font-medium'}" title="${escapeLogHtml(urlText)}">${escapeLogHtml(urlText.replace(/^https?:\/\//,'').slice(0,80))}</span></div><button onclick="closeCaptchaResource(${slotId},${p.index})" class="shrink-0 inline-flex items-center justify-center rounded-md border border-border hover:bg-red-50 hover:text-red-700 h-6 px-2 text-[11px]">关闭</button></div>`},
+        renderCaptchaResSlot=s=>{if(s.error)return`<div class="rounded-lg border border-red-200 bg-red-50 p-4"><p class="text-sm text-red-700">槽位 ${s.slot_id??'?'} 状态读取失败：${escapeLogHtml(s.error)}</p></div>`;const busy=!!s.busy,busySec=s.busy_seconds,stuck=busy&&(busySec||0)>=300,unresp=(s.pages||[]).some(p=>p.responsive===false);const borderColor=stuck||unresp?'border-red-300':(busy?'border-orange-300':'border-border');const stateBadge=busy?`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs ${stuck?'bg-red-50 text-red-700':'bg-orange-50 text-orange-700'} font-medium">${stuck?'打码疑似卡死':'打码中'} ${formatCaptchaResDuration(busySec)}</span>`:(s.has_browser?`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-green-50 text-green-700">空闲 ${formatCaptchaResDuration(s.idle_seconds)}</span>`:'<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-gray-100 text-gray-600">无浏览器</span>');const pages=(s.pages||[]);return`<div class="rounded-lg border ${borderColor} bg-background p-4" data-slot="${s.slot_id}"><div class="flex flex-wrap items-center justify-between gap-2 mb-3"><div class="flex items-center gap-2 flex-wrap"><span class="text-sm font-semibold">槽位 #${s.slot_id}</span>${stateBadge}${s.browser_connected===false&&s.has_browser?'<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-red-50 text-red-700">浏览器已断开</span>':''}${s.pid?`<span class="text-[11px] text-muted-foreground" title="浏览器进程 PID">PID ${s.pid}</span>`:''}</div><div class="flex items-center gap-2"><button onclick="closeCaptchaResource(${s.slot_id},null)" class="inline-flex items-center justify-center rounded-md border border-border hover:bg-red-50 hover:text-red-700 h-7 px-2.5 text-xs" title="关闭该槽位整个浏览器（下次打码自动重建）">关闭浏览器</button></div></div><div class="grid gap-2 grid-cols-2 md:grid-cols-4 text-xs mb-3"><div><span class="text-muted-foreground">累计打码/失败:</span> ${s.solve_count??0} / ${s.error_count??0}</div><div><span class="text-muted-foreground">启动/复用次数:</span> ${s.launch_count??0} / ${s.reuse_count??0}</div><div><span class="text-muted-foreground">绑定Token:</span> ${s.bound_token_id!=null?('#'+s.bound_token_id):'未绑定'}</div><div class="truncate"><span class="text-muted-foreground">代理:</span> ${s.proxy?escapeLogHtml(String(s.proxy)):"无"}</div></div>${pages.length?`<div class="space-y-1.5"><p class="text-xs font-medium text-muted-foreground">页签（${pages.length}）</p>${pages.map(p=>renderCaptchaResPage(s.slot_id,p)).join('')}</div>`:'<p class="text-xs text-muted-foreground">当前没有打开的页签</p>'}</div>`},
+        loadCaptchaResources=async(opts={})=>{const silent=!!opts.silent;try{const r=await apiRequest('/api/captcha/browser-resources');if(!r)return;const d=await r.json();const notice=$('captchaResNotice');if(d.available===false){notice.textContent=d.message||'打码服务尚未初始化';notice.classList.remove('hidden');$('captchaResList').innerHTML='';renderCaptchaResSummary({slots:0,browsers:0,pages:0,busy:0,unresponsive_pages:0});return}notice.classList.add('hidden');renderCaptchaResSummary(d.summary||{});const list=d.slots||[];const el=$('captchaResList');if(!list.length){el.innerHTML='<div class="py-8 px-3 text-center text-sm text-muted-foreground">当前没有打码浏览器槽位（尚未触发过打码）</div>';return}el.innerHTML=list.map(renderCaptchaResSlot).join('')}catch(e){console.error('加载打码资源失败:',e);if(!silent)showToast('加载打码资源失败: '+e.message,'error')}},
+        closeCaptchaResource=async(slotId,pageIndex)=>{const what=pageIndex==null?`槽位 ${slotId} 的整个浏览器`:`槽位 ${slotId} 的页签 #${pageIndex}`;if(!confirm(`确定关闭${what}吗？登录态保留在数据库，下次打码自动重建。`))return;try{const r=await apiRequest('/api/captcha/browser-resources/close',{method:'POST',body:JSON.stringify({slot_id:slotId,page_index:pageIndex==null?null:pageIndex})});if(!r)return;const d=await r.json();if(r.ok&&d.success){showToast(d.message||'已关闭','success')}else{showToast(d.detail||'关闭失败','error',5000)}}catch(e){showToast('关闭失败: '+e.message,'error')}await loadCaptchaResources({silent:true})},
+        switchTab=t=>{const cap=n=>n.charAt(0).toUpperCase()+n.slice(1);['tokens','settings','logs','keeper','captchaResources'].forEach(n=>{const active=n===t;$(`panel${cap(n)}`).classList.toggle('hidden',!active);$(`tab${cap(n)}`).classList.toggle('border-primary',active);$(`tab${cap(n)}`).classList.toggle('text-primary',active);$(`tab${cap(n)}`).classList.toggle('border-transparent',!active);$(`tab${cap(n)}`).classList.toggle('text-muted-foreground',!active)});if(t!=='keeper')keeperStopPolling();if(t!=='captchaResources')stopCaptchaResAutoRefresh();if(t==='settings'){stopLogsAutoRefresh();loadAdminConfig();loadProxyConfig();loadCacheConfig();loadGenerationTimeout();loadCallLogicConfig();loadCaptchaConfig();loadPluginConfig();loadATAutoRefreshConfig()}else if(t==='logs'){startLogsAutoRefresh();loadLogs()}else if(t==='keeper'){stopLogsAutoRefresh();keeperStartPolling()}else if(t==='captchaResources'){stopLogsAutoRefresh();loadCaptchaResources();startCaptchaResAutoRefresh()}else{stopLogsAutoRefresh()}};
 
         function escapeLogHtml(text){
             if(text===null||text===undefined) return '';
